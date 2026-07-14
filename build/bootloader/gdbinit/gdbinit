@@ -1,0 +1,2 @@
+source C:/esp/warning_device/build/bootloader/gdbinit/symbols
+source C:/esp/warning_device/build/bootloader/gdbinit/connect

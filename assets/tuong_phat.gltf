@@ -1,0 +1,127 @@
+{
+  "asset": {
+    "version": "2.0",
+    "generator": "make_buddha_gltf.py"
+  },
+  "scene": 0,
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ],
+      "name": "Scene"
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "name": "TuongPhat",
+      "translation": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "name": "BuddhaStatue",
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0,
+            "NORMAL": 1,
+            "COLOR_0": 2
+          },
+          "indices": 3,
+          "mode": 4,
+          "material": 0
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "BuddhaMat",
+      "pbrMetallicRoughness": {
+        "baseColorFactor": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "metallicFactor": 0.35,
+        "roughnessFactor": 0.45
+      },
+      "doubleSided": true
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 4937,
+      "type": "VEC3",
+      "max": [
+        1.149999976158142,
+        2.1500000953674316,
+        1.149999976158142
+      ],
+      "min": [
+        -1.149999976158142,
+        -0.05000000074505806,
+        -1.149999976158142
+      ]
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 4937,
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5126,
+      "count": 4937,
+      "type": "VEC4"
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5125,
+      "count": 26040,
+      "type": "SCALAR"
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 59244,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 59244,
+      "byteLength": 59244,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 118488,
+      "byteLength": 78992,
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteOffset": 197480,
+      "byteLength": 104160,
+      "target": 34963
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 301640,
+      "uri": "tuong_phat.bin"
+    }
+  ]
+}

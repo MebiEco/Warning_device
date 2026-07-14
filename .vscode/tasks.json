@@ -1,0 +1,61 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ESP-IDF: Build",
+      "type": "shell",
+      "command": "idf.py",
+      "args": ["build"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "IDF_PATH": "C:\\esp\\v5.3.4\\esp-idf"
+        }
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF: Flash UART (COM5)",
+      "type": "shell",
+      "command": "idf.py",
+      "args": ["-p", "COM5", "-b", "115200", "flash"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "IDF_PATH": "C:\\esp\\v5.3.4\\esp-idf"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF: Monitor",
+      "type": "shell",
+      "command": "idf.py",
+      "args": ["-p", "COM5", "-b", "115200", "monitor"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "IDF_PATH": "C:\\esp\\v5.3.4\\esp-idf"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF: Flash + Monitor",
+      "type": "shell",
+      "command": "idf.py",
+      "args": ["-p", "COM5", "-b", "115200", "flash", "monitor"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "IDF_PATH": "C:\\esp\\v5.3.4\\esp-idf"
+        }
+      },
+      "problemMatcher": []
+    }
+  ]
+}

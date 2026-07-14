@@ -1,0 +1,20 @@
+# ESP32-WROVER-E Custom Partition Table (16MB Flash, OTA dual-slot)
+#
+# Flash layout (total 16MB = 0x1000000):
+#   0x000000 - 0x008FFF  Bootloader  (reserved)
+#   0x009000 - 0x00CFFF  NVS         (16KB)
+#   0x00D000 - 0x00EFFF  OTA Data    (8KB)
+#   0x00F000 - 0x00FFFF  PHY Init    (4KB)
+#   0x010000 - 0x40FFFF  ota_0       (4MB)
+#   0x410000 - 0x80FFFF  ota_1       (4MB)
+#   0x810000 - 0x90FFFF  storage     (1MB SPIFFS)  config / small files
+#   0x910000 - 0xFFFFFF  audio       (~6.94MB FAT) alarm .wav files
+#
+# Name,     Type,  SubType,  Offset,    Size
+nvs,         data,  nvs,      0x9000,    0x4000,
+otadata,     data,  ota,      0xD000,    0x2000,
+phy_init,    data,  phy,      0xF000,    0x1000,
+ota_0,       app,   ota_0,    0x10000,   0x400000,
+ota_1,       app,   ota_1,    0x410000,  0x400000,
+storage,     data,  spiffs,   0x810000,  0x100000,
+audio,       data,  fat,      0x910000,  0x6F0000,

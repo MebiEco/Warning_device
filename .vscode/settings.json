@@ -1,0 +1,17 @@
+{
+  "idf.currentSetup": "C:\\esp\\v5.3.4\\esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32"
+  },
+  "cmake.sourceDirectory": "C:/esp/warning_device",
+  "idf.flashType": "UART",
+  "idf.portWin": "COM8",
+  "idf.flashBaudRate": "115200",
+  "idf.monitorBaudRate": "115200",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\esp\\warning_device\\build"
+  ]
+}
