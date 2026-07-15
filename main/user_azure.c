@@ -21,6 +21,7 @@
  ******************************************************************************/
 
 #include "user_azure.h"
+#include "user_system.h"
 #include "azure_sample_connection.h"
 
 /* Azure Provisioning/IoT Hub library includes */
@@ -52,14 +53,11 @@
 // #include "sample_azure_iot_pnp_data_if.h"
 
 #include "freertos/event_groups.h"
-#include "user_azure.h"
-#include "user_system.h"
 #include "user_http_server.h"
 #include "user_ota.h"
 #include "user_audio_files.h"
 #include "esp_system.h"
 
-#include "esp_system.h"
 #include "esp_log.h"
 
 bool bIsOtaActivated = false;
@@ -428,7 +426,7 @@ void User_Azure_Task(void) {
     }
   }
 
-  while (1) 
+    while (1) 
   {
     if (bOtaPendingDownload) {
         bOtaPendingDownload = false;
@@ -441,6 +439,8 @@ void User_Azure_Task(void) {
             esp_restart();
         }
     }
+
+    audio_files_run_pending_download();
 
     if(!Is_System_Internet_Connected())
         {
@@ -456,15 +456,14 @@ void User_Azure_Task(void) {
 
         if(IoTHubHandle.isNeedReinit)
         {
+            ESP_LOGW("AZURE: REINIT", "Releasing Azure client — reconnect with current config");
             if(xSemaphoreTake(azureMutex, pdMS_TO_TICKS(3000U)) == pdTRUE)
             {
                 IoTHubHandle.isNeedReinit = false;
-                AzureIoTHubClient_Deinit(&xAzureIoTHubClient);
-                /* Đóng TLS socket cũ trước khi kết nối lại
-                 * (AzureIoTHubClient_Deinit không đóng TLS socket,
-                 * nếu không đóng thì TLS_Socket_Connect sẽ dùng lại
-                 * transport handle cũ đã stale → "Failed to create socket") */
-                TLS_Socket_Disconnect(&xNetworkContext);
+                if (IoTHubHandle.isAzureInitialized) {
+                    AzureIoTHubClient_Deinit(&xAzureIoTHubClient);
+                    TLS_Socket_Disconnect(&xNetworkContext);
+                }
                 IoTHubHandle.isAzureInitialized = false;
                 xSemaphoreGive(azureMutex);
             }
@@ -488,7 +487,8 @@ void User_Azure_Task(void) {
         while(1)
         {
             vTaskDelay(pdMS_TO_TICKS(500));
-            if(IoTHubHandle.isNeedReinit || !Is_System_Internet_Connected() || bOtaPendingDownload)
+            if(IoTHubHandle.isNeedReinit || !Is_System_Internet_Connected() ||
+               bOtaPendingDownload || bAudioDownloadPending)
             {
                 break;
             }
@@ -626,7 +626,7 @@ void Azure_Handle_Direct_Method_Data(cJSON *payload, DirectMethodResponse_t *res
     if ((code_item != NULL) && (data_item != NULL))
     {
         _code = code_item->valueint;
-        if(_code == _CMD_CODE_LOA) //code=100
+        if(_code == CMD_CODE_LOA) //code=100
         {
           cJSON *Value = cJSON_GetObjectItem(data_item, "Value");
           cJSON *PondId = cJSON_GetObjectItem(data_item, "PondId");
@@ -710,7 +710,7 @@ void Azure_Handle_Direct_Method_Data(cJSON *payload, DirectMethodResponse_t *res
             }
           }
         }
-        else if(_code == _CMD_CODE_CHUONG) //code=101
+        else if(_code == CMD_CODE_CONTROL_ON_OFF) //code=101
         {
           cJSON *Value = cJSON_GetObjectItem(data_item, "Value");
           cJSON *Duration = cJSON_GetObjectItem(data_item, "Duration");
@@ -795,7 +795,7 @@ void Azure_Handle_Direct_Method_Data(cJSON *payload, DirectMethodResponse_t *res
           }
         }
 
-        else if (_code == _CMD_CODE_AUDIO_DOWNLOAD) // 103
+        else if (_code == CMD_CODE_AUDIO_DOWNLOAD) // 600
         {
             cJSON *Url = cJSON_GetObjectItem(data_item, "Url");
             cJSON *FileName = cJSON_GetObjectItem(data_item, "FileName");
@@ -820,7 +820,7 @@ void Azure_Handle_Direct_Method_Data(cJSON *payload, DirectMethodResponse_t *res
             response->status = COMMAND_STATUS_OK;
             response->payloadLength = sprintf(response->payload, "{\"status\":\"download queued\"}");
         }
-        else if (_code == _CMD_CODE_AUDIO_DELETE) // 104
+        else if (_code == CMD_CODE_AUDIO_DELETE) // 601
         {
             cJSON *FileName = cJSON_GetObjectItem(data_item, "FileName");
             if (!FileName || !cJSON_IsString(FileName))
@@ -846,7 +846,7 @@ void Azure_Handle_Direct_Method_Data(cJSON *payload, DirectMethodResponse_t *res
                 response->payloadLength = sprintf(response->payload, "{\"status\":\"deleted\"}");
             }
         }
-        else if (_code == _CMD_CODE_AUDIO_LIST) // 105
+        else if (_code == CMD_CODE_AUDIO_LIST) // 602
         {
             if (!audio_files_sd_ready())
             {

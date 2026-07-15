@@ -1,0 +1,83 @@
+================================================================================
+  WARNING DEVICE — Audio commands for Backend (Code 600 / 601 / 602)
+================================================================================
+Date: 2026-07-15
+
+Method name : Control
+Content-Type: application/json
+
+Envelope:
+{
+  "Code": <number>,
+  "TimeStamp": <unix_seconds>,
+  "Data": { ... }
+}
+
+--------------------------------------------------------------------------------
+600 — DOWNLOAD (create / replace file on SD)
+--------------------------------------------------------------------------------
+{
+  "Code": 600,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "Url": "https://YOUR_ACCOUNT.blob.core.windows.net/CONTAINER/121.wav?sv=...&sig=...",
+    "FileName": "121.wav"
+  }
+}
+
+Rules:
+- Url MUST be https://  (http rejected)
+- FileName: [A-Za-z0-9._-] only, no path, no ".."
+- FAT 8.3: base name <= 8 chars, extension <= 3 chars
+  OK : 121.wav , alarm.wav
+  BAD: my_long_name.wav
+- One download at a time; if busy -> error
+- Device may pause Bluetooth during download
+
+OK response:
+  {"status":"download queued"}
+
+--------------------------------------------------------------------------------
+601 — DELETE file on SD
+--------------------------------------------------------------------------------
+{
+  "Code": 601,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "FileName": "121.wav"
+  }
+}
+
+OK response:
+  {"status":"deleted"}
+
+--------------------------------------------------------------------------------
+602 — LIST files on SD
+--------------------------------------------------------------------------------
+{
+  "Code": 602,
+  "TimeStamp": 1744520000,
+  "Data": {}
+}
+
+OK response (may truncate if many files, buffer ~256 bytes):
+  {"files":[{"name":"121.WAV","size":961072}, ...]}
+
+--------------------------------------------------------------------------------
+Recommended sequence (replace then play)
+--------------------------------------------------------------------------------
+1. Code 601 — delete (optional if 600 overwrites)
+2. Code 600 — download
+3. Wait until download finishes
+4. Code 100 — play alarm (separate; not 600/601/602)
+
+Do NOT send Code 100 while Code 600 is still downloading the same file.
+
+Defines (firmware user_system.h):
+  CMD_CODE_AUDIO_DOWNLOAD = 600
+  CMD_CODE_AUDIO_DELETE   = 601
+  CMD_CODE_AUDIO_LIST     = 602
+
+================================================================================
+END
+================================================================================

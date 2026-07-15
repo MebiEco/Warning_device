@@ -574,6 +574,9 @@ void app_main(void)
       User_System_Init();
       log_heap("after wifi");
 
+      /* Queues need INTERNAL RAM — create before BT eats the heap */
+      audio_queues_init();
+
       /* Khởi chạy 3 tác vụ LED */
       start_led_tasks();
 
@@ -595,16 +598,16 @@ void app_main(void)
           ESP_LOGI(TAG, "Create Timer task successfully");
       }
 
-      /* NTP tối đa ~15s trong Timer task; app_main cũng không treo vô hạn */
+      /* NTP: Timer task sync; app_main chờ tối đa 8s rồi boot tiếp */
       {
-          const int ntp_deadline_ms = 20000;
+          const int ntp_deadline_ms = 8000;
           int waited = 0;
           while (!Sys_Info.isTimeSync && waited < ntp_deadline_ms) {
-              vTaskDelay(pdMS_TO_TICKS(500));
-              waited += 500;
+              vTaskDelay(pdMS_TO_TICKS(200));
+              waited += 200;
           }
           if (!Sys_Info.isTimeSync) {
-              ESP_LOGW(TAG, "NTP not ready after %d ms — continue boot (will sync in background)", ntp_deadline_ms);
+              ESP_LOGW(TAG, "NTP not ready after %d ms — continue boot (sync in background)", ntp_deadline_ms);
           }
       }
       log_heap("after ntp");

@@ -1,8 +1,15 @@
 #include "user_excute_audio.h"
+#include "user_bluetooth.h"
+#include "user_audio_files.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "driver/gpio.h"
+#include "freertos/idf_additions.h"
+#include <ctype.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
+#include <errno.h>
 
 static const char *TAG = "PLAYER";
 
@@ -18,6 +25,25 @@ int file_to_play = 0;
 bool is_playing = false;
 QueueHandle_t alarm_queue = NULL;
 QueueHandle_t siren_queue = NULL;
+
+void audio_queues_init(void)
+{
+  /* Must be INTERNAL — FreeRTOS queue in PSRAM asserts / crashes on ESP32 */
+  if (alarm_queue == NULL) {
+    alarm_queue = xQueueCreateWithCaps(10, sizeof(AlarmCmd_t),
+                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!alarm_queue) {
+      ESP_LOGE(TAG, "alarm_queue create failed (need internal RAM)");
+    }
+  }
+  if (siren_queue == NULL) {
+    siren_queue = xQueueCreateWithCaps(5, sizeof(SirenCmd_t),
+                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!siren_queue) {
+      ESP_LOGE(TAG, "siren_queue create failed (need internal RAM)");
+    }
+  }
+}
 
 void Stop_Alarm(void)
 {
@@ -36,17 +62,21 @@ void sd_read_task(void *pvParameters)
 {
   FILE *f_music = NULL;
 
-  psram_audio_buffer = malloc(MAX_AUDIO_BUFFER_SIZE);
-  if (!psram_audio_buffer)
-  {
-    ESP_LOGE(TAG, "Failed to allocate 2MB static buffer in PSRAM!");
+  audio_queues_init();
+  if (alarm_queue == NULL) {
+    ESP_LOGE(TAG, "No alarm_queue — SD Read task exiting");
     vTaskDelete(NULL);
+    return;
   }
 
-  if (alarm_queue == NULL)
+  psram_audio_buffer = heap_caps_malloc(MAX_AUDIO_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!psram_audio_buffer)
   {
-    alarm_queue = xQueueCreate(10, sizeof(AlarmCmd_t));
+    ESP_LOGE(TAG, "Failed to allocate 2MB buffer in PSRAM!");
+    vTaskDelete(NULL);
+    return;
   }
+  ESP_LOGI(TAG, "Audio buffer OK in PSRAM (%d bytes)", MAX_AUDIO_BUFFER_SIZE);
 
   while (1)
   {
@@ -67,7 +97,48 @@ void sd_read_task(void *pvParameters)
         } else {
           snprintf(path, sizeof(path), "/sdcard/%d.wav", current_cmd.file_id);
         }
+
+        /* Avoid play while delete+download in progress (file may not exist yet) */
+        if (audio_files_is_download_busy()) {
+          ESP_LOGW(TAG, "Download in progress — wait before playing %s", path);
+          if (!audio_files_wait_idle(120000)) {
+            ESP_LOGE(TAG, "Timeout waiting for download — skip alarm");
+            play_state = 0;
+            continue;
+          }
+        }
+
+        /* BT mode: need A2DP stream — don't block radio with huge SD read first */
+        if (user_bluetooth_is_active()) {
+          if (!user_bluetooth_wait_for_media(20000)) {
+            ESP_LOGW(TAG, "A2DP not ready — alarm may be silent until speaker links");
+          }
+        }
+
         f_music = fopen(path, "rb");
+        if (!f_music) {
+          /* FAT 8.3 often stores upper-case; try .WAV */
+          char alt[96];
+          strncpy(alt, path, sizeof(alt) - 1);
+          alt[sizeof(alt) - 1] = '\0';
+          char *dot = strrchr(alt, '.');
+          if (dot && strcasecmp(dot, ".wav") == 0) {
+            for (char *p = dot + 1; *p; p++) {
+              *p = (char)toupper((unsigned char)*p);
+            }
+            f_music = fopen(alt, "rb");
+            if (f_music) {
+              strncpy(path, alt, sizeof(path) - 1);
+            }
+          }
+        }
+        if (!f_music) {
+          /* Brief retry — SD may still be flushing rename after download */
+          for (int t = 0; t < 10 && !f_music; t++) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            f_music = fopen(path, "rb");
+          }
+        }
         if (f_music)
         {
           fseek(f_music, 0, SEEK_END);
@@ -84,13 +155,30 @@ void sd_read_task(void *pvParameters)
             }
 
             ESP_LOGI(TAG, "Reading %ld bytes into static PSRAM buffer...", audio_size);
-            size_t read_bytes = fread(psram_audio_buffer, 1, audio_size, f_music);
+            /* Chunked read + yield — full fread starved BT (AVRC-only / disconnect) */
+            size_t read_bytes = 0;
+            while (read_bytes < (size_t)audio_size) {
+              size_t want = (size_t)audio_size - read_bytes;
+              if (want > 8192) {
+                want = 8192;
+              }
+              size_t n = fread(psram_audio_buffer + read_bytes, 1, want, f_music);
+              if (n == 0) {
+                break;
+              }
+              read_bytes += n;
+              vTaskDelay(1);
+            }
             if (read_bytes > 0)
             {
               psram_audio_len = read_bytes;
               psram_audio_pos = 0;
+              if (user_bluetooth_is_active() && !user_bluetooth_is_media_ready()) {
+                ESP_LOGW(TAG, "Loaded %s but A2DP still not streaming — waiting...", path);
+                (void)user_bluetooth_wait_for_media(10000);
+              }
               is_playing = true;
-              ESP_LOGI(TAG, "Successfully loaded and playing: %s", path);
+              ESP_LOGI(TAG, "Successfully loaded and playing: %s (%u bytes)", path, (unsigned)read_bytes);
             }
             else
             {
@@ -103,7 +191,7 @@ void sd_read_task(void *pvParameters)
         }
         else
         {
-          ESP_LOGE(TAG, "Cannot open file: %s", path);
+          ESP_LOGE(TAG, "Cannot open file: %s (errno=%d)", path, errno);
           play_state = 0;
         }
       }
@@ -162,7 +250,12 @@ void Bell_Task(void *pvParameters)
 
   if (siren_queue == NULL)
   {
-    siren_queue = xQueueCreate(5, sizeof(SirenCmd_t));
+    audio_queues_init();
+  }
+  if (siren_queue == NULL) {
+    ESP_LOGE("BELL", "No siren_queue — Bell task exiting");
+    vTaskDelete(NULL);
+    return;
   }
 
   SirenCmd_t cmd;

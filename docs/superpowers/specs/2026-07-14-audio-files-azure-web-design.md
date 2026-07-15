@@ -9,9 +9,9 @@ Quản lý file âm thanh trên thẻ SD: tải từ Azure Blob (HTTPS/SAS), xó
 ## Commands (Azure method `Control`)
 | Code | Action | Data |
 |------|--------|------|
-| 103 | Download | `Url`, `FileName` |
-| 104 | Delete | `FileName` |
-| 105 | List | (empty) → JSON files+sizes |
+| 600 | Download | `Url`, `FileName` |
+| 601 | Delete | `FileName` |
+| 602 | List | (empty) → JSON files+sizes |
 
 ## Web
 Tab Audio: list + refresh, delete, form Url+FileName download.
@@ -20,4 +20,4 @@ Tab Audio: list + refresh, delete, form Url+FileName download.
 - SD card only (`isSdCardReady`). Flash fallback ≠ ready for these ops.
 - `FileName` user-defined; sanitize `[A-Za-z0-9._-]`; block `..` / `/`.
 - Code 100: optional `FileName`; else `/sdcard/{PondId*100+DeviceId}.wav`.
-- Shared download helper (HTTPS) used by Azure 103 and web.
+- Shared download helper (HTTPS) used by Azure 600 and web.

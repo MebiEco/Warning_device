@@ -86,14 +86,16 @@ int s_bt_retry_count = 0;
 static bool is_bt_initialized = false;
 static bool s_audio_cfg_received = false;
 static bool s_bt_shutting_down = false;
+static volatile bool s_bt_wifi_priority = false;
 
 #define BT_CONNECT_RETRY_MAX 10
 #define BT_RETRY_DELAY_HEARTBEATS 3
 #define BT_CONNECT_TIMEOUT_HEARTBEATS 6
 /* Heartbeat timer = 2s. Nudge media ctrl every ~12s while idle. */
 #define BT_KEEPALIVE_HEARTBEATS 6
-/* Continuous soft tone — silence/short bursts still let AW-TREK auto-off (~10 min). */
-#define BT_IDLE_KEEPALIVE_AMP  100
+/* Continuous soft tone — silence/short bursts still let AW-TREK auto-off (~10 min).
+ * Amplitude ~peak sample (<< 32767). Lower = quieter; too low → speaker sleeps. */
+#define BT_IDLE_KEEPALIVE_AMP  40
 
 static bool s_avrc_connected = false;
 static uint32_t s_idle_phase = 0;
@@ -141,7 +143,10 @@ static void bt_schedule_reconnect(const char *reason)
 /* Speaker powered off / link lost while previously connected — reconnect without burning retry budget */
 static void bt_on_speaker_lost(const char *reason)
 {
-  if (s_bt_shutting_down) {
+  if (s_bt_shutting_down || s_bt_wifi_priority) {
+    s_avrc_connected = false;
+    s_media_state = APP_AV_MEDIA_STATE_IDLE;
+    s_a2d_state = APP_AV_STATE_UNCONNECTED;
     return;
   }
   ESP_LOGW(BT_AV_TAG, "[BT] %s (%s) — will reconnect when speaker is on", reason, s_peer_bdname);
@@ -149,10 +154,20 @@ static void bt_on_speaker_lost(const char *reason)
   s_media_state = APP_AV_MEDIA_STATE_IDLE;
   s_audio_cfg_received = false;
   s_idle_heartbeat_cnt = 0;
-  s_bt_retry_count = 0;
-  s_bt_retry_delay_ticks = 1;
-  s_a2d_state = APP_AV_STATE_UNCONNECTED;
   s_connecting_intv = 0;
+
+  /* Mid reconnect: do not reset retry / reconnect every ~2s (Bluedroid OOM crash). */
+  if (s_a2d_state == APP_AV_STATE_CONNECTING || s_a2d_state == APP_AV_STATE_UNCONNECTED) {
+    if (s_bt_retry_delay_ticks < BT_RETRY_DELAY_HEARTBEATS) {
+      s_bt_retry_delay_ticks = BT_RETRY_DELAY_HEARTBEATS;
+    }
+    s_a2d_state = APP_AV_STATE_UNCONNECTED;
+    return;
+  }
+
+  s_bt_retry_count = 0;
+  s_bt_retry_delay_ticks = BT_RETRY_DELAY_HEARTBEATS * 2; /* ~12 s */
+  s_a2d_state = APP_AV_STATE_UNCONNECTED;
 }
 
 static void bt_fill_idle_audio(uint8_t *data, int32_t len)
@@ -173,7 +188,7 @@ static void bt_fill_idle_audio(uint8_t *data, int32_t len)
 
 static void bt_nudge_stream_keepalive(void)
 {
-  if (s_a2d_state != APP_AV_STATE_CONNECTED) {
+  if (s_bt_wifi_priority || s_a2d_state != APP_AV_STATE_CONNECTED) {
     return;
   }
   ESP_LOGI(BT_AV_TAG, "[BT] Keepalive: nudging A2DP stream (speaker idle)");
@@ -186,6 +201,9 @@ static void bt_nudge_stream_keepalive(void)
 
 static void bt_begin_connect(void)
 {
+  if (s_bt_wifi_priority) {
+    return;
+  }
   if (s_a2d_state == APP_AV_STATE_CONNECTED || s_a2d_state == APP_AV_STATE_CONNECTING) {
     return;
   }
@@ -195,6 +213,53 @@ static void bt_begin_connect(void)
   s_a2d_state = APP_AV_STATE_CONNECTING;
   s_connecting_intv = 0;
   s_audio_cfg_received = false;
+}
+
+void user_bt_pause_for_wifi(void)
+{
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  if (s_bt_wifi_priority) {
+    return;
+  }
+  s_bt_wifi_priority = true;
+  if (!is_bt_initialized) {
+    return;
+  }
+  ESP_LOGI(BT_AV_TAG, "[BT] Pause A2DP for WiFi/TLS download");
+  if (s_a2d_state == APP_AV_STATE_CONNECTED ||
+      s_a2d_state == APP_AV_STATE_CONNECTING ||
+      s_a2d_state == APP_AV_STATE_DISCONNECTING) {
+    if (s_media_state == APP_AV_MEDIA_STATE_STARTED ||
+        s_media_state == APP_AV_MEDIA_STATE_STARTING) {
+      esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+    }
+    esp_a2d_source_disconnect(s_peer_bda);
+    s_media_state = APP_AV_MEDIA_STATE_IDLE;
+    s_avrc_connected = false;
+    s_a2d_state = APP_AV_STATE_UNCONNECTED;
+    s_connecting_intv = 0;
+  }
+  /* Let ACL/media tear down before WiFi grabs the radio */
+  vTaskDelay(pdMS_TO_TICKS(400));
+}
+
+void user_bt_resume_after_wifi(void)
+{
+  if (!s_bt_wifi_priority) {
+    return;
+  }
+  s_bt_wifi_priority = false;
+  ESP_LOGI(BT_AV_TAG, "[BT] Resume A2DP after WiFi/TLS");
+  esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+  if (!is_bt_initialized || s_bt_shutting_down) {
+    return;
+  }
+  /* Reconnect soon — do not burn retry budget for intentional pause */
+  s_bt_retry_count = 0;
+  s_bt_retry_delay_ticks = 1;
+  if (s_a2d_state != APP_AV_STATE_CONNECTED && s_a2d_state != APP_AV_STATE_CONNECTING) {
+    s_a2d_state = APP_AV_STATE_UNCONNECTED;
+  }
 }
 
 #define NVS_BT_NAMESPACE "bt_config"
@@ -581,6 +646,9 @@ static void bt_app_av_state_unconnected_hdlr(uint16_t event, void *param)
   case ESP_A2D_PROF_STATE_EVT:
     break;
   case BT_APP_HEART_BEAT_EVT:
+    if (s_bt_wifi_priority) {
+        break;
+    }
     if (!Sys_Info.isTimeSync) {
         ESP_LOGW(BT_AV_TAG, "[BT] Waiting for NTP time sync before connecting...");
         break;
@@ -627,15 +695,24 @@ static void bt_app_av_state_connecting_hdlr(uint16_t event, void *param)
   case ESP_A2D_AUDIO_STATE_EVT:
   case ESP_A2D_AUDIO_CFG_EVT:
   case ESP_A2D_MEDIA_CTRL_ACK_EVT:
+  case ESP_A2D_PROF_STATE_EVT:
     break;
   case BT_APP_HEART_BEAT_EVT:
+    if (s_bt_wifi_priority) {
+      break;
+    }
     if (user_bluetooth_is_connected()) {
       s_connecting_intv = 0;
       break;
     }
     if (s_avrc_connected) {
-      /* AVRC alone is not enough — keep waiting for A2DP or retry */
-      if (++s_connecting_intv >= BT_CONNECT_TIMEOUT_HEARTBEATS) {
+      /* Hold while alarm loading/playing — do not tear down mid-play */
+      if (is_playing || play_state != 0) {
+        s_connecting_intv = 0;
+        break;
+      }
+      /* AVRC alone is not enough — keep waiting longer for A2DP */
+      if (++s_connecting_intv >= (BT_CONNECT_TIMEOUT_HEARTBEATS * 2)) {
         bt_schedule_reconnect("AVRC only, A2DP not ready");
       }
       break;
@@ -665,6 +742,9 @@ static void bt_app_av_media_proc(uint16_t event, void *param)
   {
   case APP_AV_MEDIA_STATE_IDLE:
   {
+    if (s_bt_wifi_priority) {
+      break;
+    }
     if (event == BT_APP_HEART_BEAT_EVT) {
       ESP_LOGD(BT_AV_TAG, "[BT] Checking A2DP media source readiness...");
       esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
@@ -1044,6 +1124,44 @@ void user_bluetooth_deinit(void)
 bool user_bluetooth_is_connected(void)
 {
   return s_a2d_state == APP_AV_STATE_CONNECTED;
+}
+
+bool user_bluetooth_is_active(void)
+{
+  return is_bt_initialized && !s_bt_shutting_down;
+}
+
+bool user_bluetooth_is_media_ready(void)
+{
+  return s_a2d_state == APP_AV_STATE_CONNECTED &&
+         s_media_state == APP_AV_MEDIA_STATE_STARTED;
+}
+
+bool user_bluetooth_wait_for_media(uint32_t timeout_ms)
+{
+  if (!user_bluetooth_is_active()) {
+    return false;
+  }
+  if (user_bluetooth_is_media_ready()) {
+    return true;
+  }
+  ESP_LOGI(BT_AV_TAG, "Waiting up to %" PRIu32 " ms for A2DP audio stream...", timeout_ms);
+  uint32_t elapsed = 0;
+  while (elapsed < timeout_ms) {
+    if (user_bluetooth_is_media_ready()) {
+      ESP_LOGI(BT_AV_TAG, "A2DP stream ready.");
+      return true;
+    }
+    /* Nudge media start if already connected */
+    if (s_a2d_state == APP_AV_STATE_CONNECTED &&
+        s_media_state == APP_AV_MEDIA_STATE_IDLE) {
+      esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+    elapsed += 200;
+  }
+  ESP_LOGW(BT_AV_TAG, "A2DP stream not ready after %" PRIu32 " ms", timeout_ms);
+  return false;
 }
 
 bool user_bluetooth_is_link_ready(void)

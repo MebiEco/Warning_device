@@ -700,6 +700,25 @@ SECTIONS
     
  . = ALIGN(4); 
  _ext_ram_bss_start = ABSOLUTE(.);
+    *(.ext_ram.bss .ext_ram.bss.*)
+    . = ALIGN(4);
+    _bt_bss_start = ABSOLUTE(.);
+    *libbt.a:(.bss .bss.*)
+    . = ALIGN(4);
+    _bt_bss_end = ABSOLUTE(.);
+    . = ALIGN(4);
+    _bt_common_start = ABSOLUTE(.);
+    *libbt.a:(COMMON)
+    . = ALIGN(4);
+    _bt_common_end = ABSOLUTE(.);
+    *liblwip.a:(.bss .bss.*)
+    *liblwip.a:(COMMON)
+    *libnet80211.a:(.bss .bss.*)
+    *libnet80211.a:(COMMON)
+    *libpp.a:(.bss .bss.*)
+    *libpp.a:(COMMON)
+    *libwpa_supplicant.a:(.bss .bss.*)
+    *libwpa_supplicant.a:(COMMON)
     
  . = ALIGN(4); 
  _ext_ram_bss_end = ABSOLUTE(.);
@@ -714,20 +733,9 @@ SECTIONS
      * ldgen places all bss-related data to mapping[dram0_bss]
      * (See components/esp_system/app.lf).
      */
-    *(EXCLUDE_FILE(*libbt.a *libbtdm_app.a) .bss EXCLUDE_FILE(*libbt.a *libbtdm_app.a) .bss.*)
+    *(EXCLUDE_FILE(*libbt.a *libbtdm_app.a *liblwip.a *libnet80211.a *libpp.a *libwpa_supplicant.a) .bss EXCLUDE_FILE(*libbt.a *libbtdm_app.a *liblwip.a *libnet80211.a *libpp.a *libwpa_supplicant.a) .bss.*)
     *(.dynbss .dynsbss .gnu.linkonce.b .gnu.linkonce.b.* .gnu.linkonce.sb .gnu.linkonce.sb.* .gnu.linkonce.sb2 .gnu.linkonce.sb2.* .sbss .sbss.* .sbss2 .sbss2.* .scommon .share.mem)
-    *(.ext_ram.bss .ext_ram.bss.*)
-    *(EXCLUDE_FILE(*libbt.a *libbtdm_app.a) COMMON)
-    . = ALIGN(4);
-    _bt_bss_start = ABSOLUTE(.);
-    *libbt.a:(.bss .bss.*)
-    . = ALIGN(4);
-    _bt_bss_end = ABSOLUTE(.);
-    . = ALIGN(4);
-    _bt_common_start = ABSOLUTE(.);
-    *libbt.a:(COMMON)
-    . = ALIGN(4);
-    _bt_common_end = ABSOLUTE(.);
+    *(EXCLUDE_FILE(*libbt.a *libbtdm_app.a *liblwip.a *libnet80211.a *libpp.a *libwpa_supplicant.a) COMMON)
     . = ALIGN(4);
     _bt_controller_bss_start = ABSOLUTE(.);
     *libbtdm_app.a:(.bss .bss.*)

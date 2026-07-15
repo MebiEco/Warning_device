@@ -83,7 +83,7 @@ static bool mount_flash_audio_storage(void)
 /*******************************************************************************
  * HÀM: Init_Sdcard
  * MÔ TẢ: Khởi tạo SPI bus, mount thẻ SD card vào /sdcard/
- *   - Tốc độ SPI: 2MHz (an toàn)
+ *   - Tốc độ SPI: 20MHz
  *   - Bật internal pull-up trên các chân dữ liệu
  *   - Liệt kê tất cả file trên thẻ SD sau khi mount
  * 
@@ -109,10 +109,9 @@ void Init_Sdcard(void)
     const char mount_point[] = MOUNT_POINT;
     ESP_LOGI(TAG, "Initializing SD card");
 
-    /* Khởi tạo SPI host với tốc độ 2MHz (rất an toàn) */
     ESP_LOGI(TAG, "Using SPI peripheral");
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.max_freq_khz = 2000; // 2MHz
+    host.max_freq_khz = 20000; // 20MHz
 
     /* Bật điện trở pull-up nội cho các chân SPI */
     gpio_pullup_en(PIN_NUM_MOSI);

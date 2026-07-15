@@ -7,7 +7,7 @@
 #define AUDIO_FILE_NAME_MAX  64
 #define AUDIO_FILE_URL_MAX   384
 
-/** True only when physical SD card is mounted (not flash fallback). */
+/** True when /sdcard is mounted (physical SD or flash fallback). */
 bool audio_files_sd_ready(void);
 
 /** Sanitize user filename into out; returns false if invalid. */
@@ -27,6 +27,15 @@ esp_err_t audio_files_download(const char *url, const char *filename);
 
 /** Queue download for Azure task (non-blocking). */
 bool audio_files_request_download(const char *url, const char *filename);
+
+/** Called from User_Azure_Task — performs queued HTTPS→SD download. */
+void audio_files_run_pending_download(void);
+
+/** True while a download is queued or running (do not play that file yet). */
+bool audio_files_is_download_busy(void);
+
+/** Wait until no download queued/running. Returns false on timeout. */
+bool audio_files_wait_idle(uint32_t timeout_ms);
 
 extern volatile bool bAudioDownloadPending;
 extern char g_audio_dl_url[AUDIO_FILE_URL_MAX];

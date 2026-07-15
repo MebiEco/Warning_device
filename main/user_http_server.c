@@ -173,10 +173,10 @@ static const char *js_page =
 "false,'Connecting...');pollWifiStatus(ssid,0);}).catch(function(){setMsg('wifiStatus',false,'Reconnecting...');pollWifiStatus(ssid,0);});}function pollWifiStatus(ssid,a){if(a>=15){setMsg('wifiStatus',true,'Connect failed');return;}setTimeout(function(){fetch('/api/wifi/status').then(r=>r.json()).then(d=>{if(d.connected)setMsg('wifiStatus',false,'OK IP '+d.ip);else pollWifiStatus(ssid,a+1);}).catch(function(){pollWifiStatus(ssid,a+"
 "1);});},2000);}function clearWifi(){fetch('/api/wifi/clear',{method:'POST'}).then(r=>r.json()).then(d=>setMsg('wifiStatus',false,d.msg||'Cleared')).catch(function(){setMsg('wifiStatus',true,'Error');});}function saveAzure(){var h=document.getElementById('azureHost').value,d=document.getElementById('azureDevId').value,k=document.getElementById('azureKey').value;if(!h||!d||!k){setMsg('azureStatus',t"
 "rue,'All fields required');return;}fetch('/api/azure/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host:h,deviceId:d,key:k})}).then(r=>r.json()).then(res=>setMsg('azureStatus',false,res.msg||'Saved')).catch(function(){setMsg('azureStatus',true,'Error');});}function clearAzure(){fetch('/api/azure/clear',{method:'POST'}).then(r=>r.json()).then(d=>setMsg('azure"
-"Status',false,d.msg||'Cleared')).catch(function(){setMsg('azureStatus',true,'Error');});}function scanBt(){var b=document.getElementById('scanBtBtn');b.disabled=true;b.innerHTML='<span class=\"spinner\"></span>Scan';document.getElementById('btDeviceList').innerHTML='';fetch('/api/scan').then(r=>r.json()).then(d=>{b.disabled=false;b.innerHTML='Scan Bluetooth';setMsg('btStatus',false,'Found '+d.length"
-");var ul=document.getElementById('btDeviceList');d.forEach(dev=>{var li=document.createElement('li');li.innerHTML='<div><div class=\"dev-name\">'+dev.name+'</div><div class=\"dev-mac\">'+dev.mac+'</div></div><button onclick=\"connectBt(\\''+dev.mac+'\\',this)\">Save</button>';ul.appendChild(li);});}).catch(e=>{b.disabled=false;b.innerHTML='Scan Bluetooth';setMsg('btStatus',true,'Scan error');});}function "
+"Status',false,d.msg||'Cleared')).catch(function(){setMsg('azureStatus',true,'Error');});}function scanBt(){var b=document.getElementById('scanBtBtn');b.disabled=true;b.innerHTML='<span class=\"spinner\"></span>Scan';document.getElementById('btDeviceList').innerHTML='';setMsg('btStatus',false,'Scanning ~7s...');fetchT('/api/scan',null,20000).then(r=>r.json()).then(d=>{b.disabled=false;b.innerHTML='Scan Bluetooth';if(!Array.isArray(d)){setMsg('btStatus',true,'Bad scan response');return;}setMsg('btStatus',false,'Found '+d.length"
+");var ul=document.getElementById('btDeviceList');d.forEach(dev=>{var li=document.createElement('li');li.innerHTML='<div><div class=\"dev-name\">'+dev.name+'</div><div class=\"dev-mac\">'+dev.mac+'</div></div><button onclick=\"connectBt(\\''+dev.mac+'\\',this)\">Save</button>';ul.appendChild(li);});}).catch(e=>{b.disabled=false;b.innerHTML='Scan Bluetooth';setMsg('btStatus',true,'Scan error/timeout');});}function "
 "connectBt(mac,btn){btn.disabled=true;btn.innerText='...';fetch('/api/connect',{method:'POST',body:JSON.stringify({mac:mac})}).then(r=>r.json()).then(function(){btn.innerText='Saved';setMsg('btStatus',false,'Saved — reboot to connect');}).catch(function(){btn.disabled=false;btn.innerText='Save';setMsg('btStatus',true,'Error');});}function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/10"
-"24).toFixed(1)+' KB';return (n/1048576).toFixed(2)+' MB';}function fetchT(url,opt,ms){ms=ms||8000;var c=new AbortController();var t=setTimeout(function(){c.abort();},ms);opt=opt||{};opt.signal=c.signal;return fetch(url,opt).finally(function(){clearTimeout(t);});}function refreshAudio(){var b=document.getElementById('audioRefreshBtn');b.disabled=true;b.innerHTML='...';fetchT('/api/audio/list').then"
+"24).toFixed(1)+' KB';return (n/1048576).toFixed(2)+' MB';}function fetchT(url,opt,ms){ms=ms||15000;var c=new AbortController();var t=setTimeout(function(){c.abort();},ms);opt=opt||{};opt.signal=c.signal;return fetch(url,opt).finally(function(){clearTimeout(t);});}function refreshAudio(){var b=document.getElementById('audioRefreshBtn');b.disabled=true;b.innerHTML='...';fetchT('/api/audio/list',null,20000).then"
 "(r=>r.json()).then(d=>{b.disabled=false;b.innerHTML='Refresh';var ul=document.getElementById('audioFileList');ul.innerHTML='';if(d.error){ul.innerHTML='<li class=\"empty\">'+d.error+'</li>';document.getElementById('audioCount').innerText='—';setMsg('audioStatus',true,d.error);return;}var files=d.files||[];document.getElementById('audioCount').innerText=files.length+' file(s)';setMsg('audioStatus',fa"
 "lse,files.length?'':'No files on SD');if(!files.length){ul.innerHTML='<li class=\"empty\">No audio files on SD</li>';return;}files.forEach(f=>{var li=document.createElement('li');var n=String(f.name).replace(/'/g,'');li.innerHTML='<div><div class=\"dev-name\">'+f.name+'</div><div class=\"dev-mac\">'+fmtSize(f.size)+'</div></div><button class=\"btn-del\" onclick=\"deleteAudio(\\''+n+'\\')\">Delete</button>';ul"
 ".appendChild(li);});}).catch(e=>{b.disabled=false;b.innerHTML='Refresh';document.getElementById('audioFileList').innerHTML='<li class=\"empty\">List timeout/failed — tap Refresh</li>';document.getElementById('audioCount').innerText='—';setMsg('audioStatus',true,'List failed');});}function deleteAudio(name){if(!confirm('Delete '+name+'?'))return;fetchT('/api/audio/delete',{method:'POST',headers:{'Con"
@@ -403,7 +403,7 @@ static esp_err_t wifi_clear_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /api/azure/save — save Azure IoT Hub config */
+/* POST /api/azure/save — save Azure IoT Hub config and reconnect (no reboot) */
 static esp_err_t azure_save_post_handler(httpd_req_t *req)
 {
     char buf[512] = {0};
@@ -416,25 +416,46 @@ static esp_err_t azure_save_post_handler(httpd_req_t *req)
     const char *devid = cJSON_GetStringValue(cJSON_GetObjectItem(root, "deviceId"));
     const char *skey  = cJSON_GetStringValue(cJSON_GetObjectItem(root, "key"));
 
-    if (host && devid && skey) {
+    if (host && devid && skey && host[0] && devid[0] && skey[0]) {
         save_azure_to_nvs(host, devid, skey);
-        ESP_LOGI(TAG, "Azure config saved: %s / %s", host, devid);
-    }
-    cJSON_Delete(root);
 
+        /* Apply live — Azure task will Deinit + Connect with new credentials */
+        memset(IoTHubHandle.hostName, 0, sizeof(IoTHubHandle.hostName));
+        memset(IoTHubHandle.deviceId, 0, sizeof(IoTHubHandle.deviceId));
+        memset(IoTHubHandle.symmetricKey, 0, sizeof(IoTHubHandle.symmetricKey));
+        strncpy(IoTHubHandle.hostName, host, sizeof(IoTHubHandle.hostName) - 1);
+        strncpy(IoTHubHandle.deviceId, devid, sizeof(IoTHubHandle.deviceId) - 1);
+        strncpy(IoTHubHandle.symmetricKey, skey, sizeof(IoTHubHandle.symmetricKey) - 1);
+        IoTHubHandle.isNeedReinit = true;
+
+        ESP_LOGI(TAG, "Azure config saved+reinit: %s / %s", host, devid);
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Connection", "close");
+        httpd_resp_send(req, "{\"msg\":\"Saved — reconnecting to Azure (no reboot)\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Connection", "close");
-    httpd_resp_send(req, "{\"msg\":\"Saved Azure Config. Please reboot to connect.\"}", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, "{\"msg\":\"Need host, deviceId, key\"}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
-/* POST /api/azure/clear — clear Azure NVS */
+/* POST /api/azure/clear — clear Azure NVS and drop connection (no reboot) */
 static esp_err_t azure_clear_post_handler(httpd_req_t *req)
 {
     clear_azure_nvs();
+    memset(IoTHubHandle.hostName, 0, sizeof(IoTHubHandle.hostName));
+    memset(IoTHubHandle.deviceId, 0, sizeof(IoTHubHandle.deviceId));
+    memset(IoTHubHandle.symmetricKey, 0, sizeof(IoTHubHandle.symmetricKey));
+    IoTHubHandle.isNeedReinit = true;
+    ESP_LOGI(TAG, "Azure credentials cleared — will disconnect (no reboot)");
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Connection", "close");
-    httpd_resp_send(req, "{\"msg\":\"Azure credentials cleared\"}", HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, "{\"msg\":\"Azure credentials cleared — disconnected\"}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -463,7 +484,7 @@ static esp_err_t audio_list_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Connection", "close");
     if (!audio_files_sd_ready()) {
-        httpd_resp_send(req, "{\"error\":\"SD card not ready\",\"files\":[]}", HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, "{\"error\":\"Storage not ready\",\"files\":[]}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     char *list = audio_files_list_json();
@@ -694,9 +715,9 @@ static httpd_handle_t start_webserver(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
     config.lru_purge_enable = true;
-    config.max_open_sockets = 4;
+    config.max_open_sockets = 3;
     config.max_uri_handlers = 24;
-    config.stack_size = 8192;
+    config.stack_size = 6144;
     config.send_wait_timeout = 10;
     config.recv_wait_timeout = 10;
 

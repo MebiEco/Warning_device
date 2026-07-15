@@ -40,5 +40,7 @@ extern AlarmCmd_t current_cmd;
 void sd_read_task(void *pvParameters);
 void Bell_Task(void *pvParameters);
 void Stop_Alarm(void);
+/** Create FreeRTOS queues in internal RAM (call early, before BT). */
+void audio_queues_init(void);
 
 #endif // USER_EXCUTE_AUDIO_H

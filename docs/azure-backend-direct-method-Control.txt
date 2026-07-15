@@ -1,0 +1,176 @@
+================================================================================
+  WARNING DEVICE — Azure IoT Hub Direct Method API (for Backend)
+================================================================================
+Date: 2026-07-15
+
+Method name:  Control
+Content-Type: application/json
+
+Envelope (all commands):
+{
+  "Code": <number>,
+  "TimeStamp": <unix_seconds>,
+  "Data": { ... }
+}
+
+--------------------------------------------------------------------------------
+1) PLAY ALARM  — Code 100
+--------------------------------------------------------------------------------
+Stop:
+{
+  "Code": 100,
+  "TimeStamp": 1744520000,
+  "Data": { "Value": 0 }
+}
+
+Play by PondId + DeviceId  →  file = /sdcard/{PondId*100+DeviceId}.wav
+Example PondId=1, DeviceId=21 → /sdcard/121.wav
+{
+  "Code": 100,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "Value": 1,
+    "PondId": 1,
+    "DeviceId": 21,
+    "Duration": 10,
+    "Repeat": 1
+  }
+}
+
+Play by FileName (optional; overrides PondId/DeviceId path):
+{
+  "Code": 100,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "Value": 1,
+    "FileName": "121.wav",
+    "Duration": 10,
+    "Repeat": 1
+  }
+}
+
+Notes:
+- Value != 0 → play; Value = 0 → stop immediately.
+- Duration (sec), Repeat required when playing.
+- Need FileName OR (PondId + DeviceId).
+- Device waits if a download (600) is still running before opening the file.
+- Prefer wait until download finishes before sending Code 100.
+
+OK response examples:
+  {"status":"queued","file":"/sdcard/121.wav"}
+  {"status":"alarm stopped"}
+
+--------------------------------------------------------------------------------
+2) BELL / SIREN (GPIO)  — Code 101
+--------------------------------------------------------------------------------
+Stop:
+{
+  "Code": 101,
+  "TimeStamp": 1744520000,
+  "Data": { "Value": 0 }
+}
+
+Start:
+{
+  "Code": 101,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "Value": 1,
+    "Duration": 5,
+    "RestTime": 3,
+    "Repeat": 2
+  }
+}
+
+Notes:
+- Duration = ON seconds, RestTime = OFF seconds between rings.
+- Repeat = number of cycles (device-specific; Repeat=0 may mean continuous — follow firmware).
+
+--------------------------------------------------------------------------------
+3) DOWNLOAD AUDIO TO SD  — Code 600  (create / replace file)
+--------------------------------------------------------------------------------
+{
+  "Code": 600,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "Url": "https://YOUR_ACCOUNT.blob.core.windows.net/CONTAINER/121.wav?sv=...&sig=...",
+    "FileName": "121.wav"
+  }
+}
+
+Rules:
+- Url MUST start with https://  (http:// rejected).
+- FileName: letters/digits . _ - only; no path, no "..".
+- SD FAT is 8.3 only: base name ≤ 8 chars, extension ≤ 3 chars.
+  Good: 121.wav, alarm.wav
+  Bad:  my_long_name.wav, 121.wav.tmp
+- Device writes temp then renames to FileName.
+- Only one download at a time; second 600 while busy → error "busy".
+- Device may pause Bluetooth during download then reconnect.
+
+OK response:
+  {"status":"download queued"}
+
+--------------------------------------------------------------------------------
+4) DELETE AUDIO ON SD  — Code 601
+--------------------------------------------------------------------------------
+{
+  "Code": 601,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "FileName": "121.wav"
+  }
+}
+
+OK response:
+  {"status":"deleted"}
+
+--------------------------------------------------------------------------------
+5) LIST AUDIO ON SD  — Code 602
+--------------------------------------------------------------------------------
+{
+  "Code": 602,
+  "TimeStamp": 1744520000,
+  "Data": {}
+}
+
+OK response (payload may be truncated if many files; buffer ~256 bytes):
+  {"files":[{"name":"121.WAV","size":961072}, ...]}
+
+--------------------------------------------------------------------------------
+6) OTA FIRMWARE  — Code 501
+--------------------------------------------------------------------------------
+{
+  "Code": 501,
+  "TimeStamp": 1744520000,
+  "Data": {
+    "Version": "1.0.2",
+    "Url": "https://YOUR_ACCOUNT.blob.core.windows.net/.../firmware.bin?sv=...&sig=..."
+  }
+}
+
+Notes:
+- Url MUST be https:// .bin (or firmware binary).
+- Device prepares system (may stop BT), downloads, flashes, reboots.
+
+--------------------------------------------------------------------------------
+RECOMMENDED SEQUENCE: replace alarm file then play
+--------------------------------------------------------------------------------
+1. Code 601 — delete old file (optional if 600 will overwrite)
+2. Code 600 — download new file
+3. Wait for device ready (download finished; or delay ~file_size / network)
+4. Code 100 — play
+
+Do NOT send Code 100 while 600 is still downloading the same file
+(file may be missing → play fails). Firmware will wait up to ~120s, but
+backend should still order commands correctly.
+
+--------------------------------------------------------------------------------
+WEB UI (LAN, optional — same SD ops)
+--------------------------------------------------------------------------------
+Browser: http://<device-ip>/
+Tab Audio: list / delete / download (Url + FileName).
+
+================================================================================
+END
+================================================================================

@@ -56,15 +56,15 @@ void User_Get_time(void)
 {
     while (!Sys_Info.isWifiConnected) {
         ESP_LOGW(TIMER_TAG, "Wait for wifi connected");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    /* Nhiều server (cần CONFIG_LWIP_SNTP_MAX_SERVERS>=3); tắt delay khởi động gây chậm boot */
+    /* Prefer reachable servers; wait_for_sync=false so we control timeout (avoid double ~15s wait). */
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
         3,
-        ESP_SNTP_SERVER_LIST("pool.ntp.org", "time.google.com", "time.cloudflare.com"));
+        ESP_SNTP_SERVER_LIST("time.google.com", "time1.google.com", "asia.pool.ntp.org"));
     cfg.sync_cb = time_sync_cb;
-    cfg.wait_for_sync = true;
+    cfg.wait_for_sync = false;
 
     esp_err_t err = esp_netif_sntp_init(&cfg);
     if (err != ESP_OK) {
@@ -72,21 +72,22 @@ void User_Get_time(void)
         return;
     }
 
-    /* Chờ tối đa 15s — tránh treo boot vô hạn nếu DNS/NTP nghẽn */
-    const int max_wait_ms = 15000;
+    ESP_LOGI(TIMER_TAG, "NTP started — waiting for sync...");
+    const int max_wait_ms = 8000;
     int waited = 0;
     while (!Sys_Info.isTimeSync && waited < max_wait_ms) {
-        err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(2000));
-        waited += 2000;
+        err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(500));
+        waited += 500;
         if (err == ESP_OK || Sys_Info.isTimeSync) {
             break;
         }
-        ESP_LOGW(TIMER_TAG, "Waiting NTP... (%d/%d ms)", waited, max_wait_ms);
+        if ((waited % 2000) == 0) {
+            ESP_LOGW(TIMER_TAG, "Waiting NTP... (%d/%d ms)", waited, max_wait_ms);
+        }
     }
 
     if (!Sys_Info.isTimeSync) {
-        ESP_LOGE(TIMER_TAG, "NTP timeout — continuing without sync (Azure SAS may fail)");
-        /* Không force isTimeSync: Azure/BT có thể retry sau khi sync nền thành công qua callback */
+        ESP_LOGW(TIMER_TAG, "NTP not ready after %d ms — continue (callback may still fire)", max_wait_ms);
     }
 
     time_t now;

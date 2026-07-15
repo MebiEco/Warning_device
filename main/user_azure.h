@@ -11,12 +11,7 @@ void User_Azure_Task(void);
 #define IOT_HUB_DEVICE_ID_LEN 32
 #define IOT_HUB_SYMMETRIC_KEY_LEN 64
 
-#define _CMD_CODE_LOA            100
-#define _CMD_CODE_CHUONG         101
-#define _CMD_CODE_AUDIO_DOWNLOAD 103
-#define _CMD_CODE_AUDIO_DELETE   104
-#define _CMD_CODE_AUDIO_LIST     105
-
+/* Command codes: see user_system.h (CMD_CODE_*) */
 
 typedef struct {
   char hostName[IOT_HUB_HOST_NAME_LEN];
