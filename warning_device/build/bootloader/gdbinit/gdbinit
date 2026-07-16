@@ -1,0 +1,2 @@
+source D:/tuvo/esp/warning_device/build/bootloader/gdbinit/symbols
+source D:/tuvo/esp/warning_device/build/bootloader/gdbinit/connect

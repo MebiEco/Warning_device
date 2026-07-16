@@ -394,23 +394,7 @@ bool audio_files_request_download(const char *url, const char *filename)
     if (!audio_files_sanitize_name(filename, safe, sizeof(safe))) {
         return false;
     }
-
-    /* Backend often sends leading/trailing spaces around Url */
-    while (*url == ' ' || *url == '\t' || *url == '\r' || *url == '\n') {
-        url++;
-    }
-    size_t url_len = strlen(url);
-    while (url_len > 0 &&
-           (url[url_len - 1] == ' ' || url[url_len - 1] == '\t' ||
-            url[url_len - 1] == '\r' || url[url_len - 1] == '\n')) {
-        url_len--;
-    }
-
-    if (url_len < 8 || strncmp(url, "https://", 8) != 0) {
-        return false;
-    }
-    if (url_len >= sizeof(g_audio_dl_url)) {
-        ESP_LOGE(TAG, "Url too long (%u)", (unsigned)url_len);
+    if (strncmp(url, "https://", 8) != 0) {
         return false;
     }
     if (!audio_files_sd_ready()) {
@@ -419,8 +403,7 @@ bool audio_files_request_download(const char *url, const char *filename)
 
     memset(g_audio_dl_url, 0, sizeof(g_audio_dl_url));
     memset(g_audio_dl_name, 0, sizeof(g_audio_dl_name));
-    memcpy(g_audio_dl_url, url, url_len);
-    g_audio_dl_url[url_len] = '\0';
+    strncpy(g_audio_dl_url, url, sizeof(g_audio_dl_url) - 1);
     strncpy(g_audio_dl_name, safe, sizeof(g_audio_dl_name) - 1);
     bAudioDownloadPending = true;
 

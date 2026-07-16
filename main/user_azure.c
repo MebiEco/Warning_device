@@ -13,7 +13,8 @@
  *     + Value=1: Phát (cần PondId, DeviceId, Duration, Repeat)
  *     + Value=0: Dừng phát
  *     + file_id = PondId * 100 + DeviceId → ví dụ: /sdcard/121.wav
- *   - Code 102: Điều khiển relay/chuông (GPIO 23)
+ *   - Code 102: Điều khiển relay/chuông (GPIO)
+ *   - Code 106: GetDeviceHealthSnapshot → response Code 300 + Data[]
  * 
  * CẤU HÌNH AZURE (có thể đổi từ trang web http://192.168.4.1):
  *   - Host Name, Device ID, Symmetric Key
@@ -56,6 +57,7 @@
 #include "user_http_server.h"
 #include "user_ota.h"
 #include "user_audio_files.h"
+#include "user_bluetooth.h"
 #include "esp_system.h"
 
 #include "esp_log.h"
@@ -256,9 +258,17 @@ static void prvHandleCommand(AzureIoTHubClientCommandRequest_t *pxMessage,
   cJSON_AddStringToObject(res, "Message", response.payload);
   char *jsonStr = cJSON_PrintUnformatted(res);
 
-  AzureIoTHubClient_SendCommandResponse(
-      &xAzureIoTHubClient, pxMessage, response.status, (const uint8_t *)jsonStr,
-      strlen(jsonStr));
+  const char *out = jsonStr;
+  size_t out_len = jsonStr ? strlen(jsonStr) : 0;
+  if (response.payload_is_full_body && response.payloadLength > 0) {
+    out = response.payload;
+    out_len = response.payloadLength;
+  }
+
+  if (out && out_len > 0) {
+    AzureIoTHubClient_SendCommandResponse(
+        &xAzureIoTHubClient, pxMessage, response.status, (const uint8_t *)out, out_len);
+  }
 
   cJSON_Delete(res);
   free(jsonStr);
@@ -612,9 +622,10 @@ BaseType_t PushTelemetry(const char *payload) {
  *     file_id = PondId * 100 + DeviceId = 121 → phát /sdcard/121.wav
  *     Value=0 → dừng phát ngay lập tức
  * 
- *   Code 102 - ĐIỀU KHIỂN RELAY (GPIO 23):
- *     Payload: {"Code":102,"Data":{"Value":1}}
- *     Value=1 → bật relay, Value=0 → tắt relay
+ *   Code 106 - HEALTH SNAPSHOT:
+ *     Payload: {"Code":106,"Data":{}}
+ *     Response body (full): {"Code":300,"TimeStamp":...,"Data":[{speaker},{bell}]}
+ *     Speaker ON = SW2 DAC mode, or SW3 BT + A2DP connected; Bell always ON
  ******************************************************************************/
 void Azure_Handle_Direct_Method_Data(cJSON *payload, DirectMethodResponse_t *response) 
 {
@@ -869,6 +880,79 @@ void Azure_Handle_Direct_Method_Data(cJSON *payload, DirectMethodResponse_t *res
                 response->payloadLength = sizeof(response->payload) - 1;
             }
             free(list);
+        }
+        else if (_code == CMD_CODE_GET_HEALTH_SNAPSHOT) // 106
+        {
+            ESP_LOGI("AZURE: ", "---------- CMD CALLBACK ----------");
+            ESP_LOGI("AZURE: ", "Code: %d (GetDeviceHealthSnapshot)", _code);
+
+            /* Speaker ON: SW2 DAC mode, or SW3 BT mode with A2DP connected.
+             * Bell: always ON (no connect / no switch). */
+            bool speaker_on = false;
+            if (sys_is_dac_i2s_mode) {
+                speaker_on = true;
+            } else if (sys_is_bt_mode && user_bluetooth_is_connected()) {
+                speaker_on = true;
+            }
+
+            cJSON *root = cJSON_CreateObject();
+            cJSON *arr = cJSON_CreateArray();
+            if (!root || !arr) {
+                cJSON_Delete(root);
+                cJSON_Delete(arr);
+                response->status = COMMAND_STATUS_DEVICE_ERROR;
+                response->payloadLength =
+                    sprintf(response->payload, "{\"error\":\"oom\"}");
+                return;
+            }
+
+            cJSON_AddNumberToObject(root, "Code", CMD_CODE_HEALTH_SNAPSHOT_RSP);
+            cJSON_AddNumberToObject(root, "TimeStamp", (double)Sys_Info.epochtime);
+            cJSON_AddItemToObject(root, "Data", arr);
+
+            cJSON *speaker = cJSON_CreateObject();
+            if (speaker) {
+                cJSON_AddStringToObject(speaker, "DeviceName", "WarningSpeaker_1");
+                cJSON_AddNumberToObject(speaker, "DeviceId", 1);
+                cJSON_AddStringToObject(speaker, "Status", speaker_on ? "ON" : "OFF");
+                cJSON_AddNumberToObject(speaker, "Index", 0);
+                cJSON_AddItemToArray(arr, speaker);
+            }
+
+            cJSON *bell = cJSON_CreateObject();
+            if (bell) {
+                cJSON_AddStringToObject(bell, "DeviceName", "WarningBell_1");
+                cJSON_AddNumberToObject(bell, "DeviceId", 2);
+                cJSON_AddStringToObject(bell, "Status", "ON");
+                cJSON_AddNumberToObject(bell, "Index", 1);
+                cJSON_AddItemToArray(arr, bell);
+            }
+
+            char *json = cJSON_PrintUnformatted(root);
+            cJSON_Delete(root);
+            if (!json) {
+                response->status = COMMAND_STATUS_DEVICE_ERROR;
+                response->payloadLength =
+                    sprintf(response->payload, "{\"error\":\"json build failed\"}");
+                return;
+            }
+
+            size_t n = strlen(json);
+            if (n >= sizeof(response->payload)) {
+                free(json);
+                response->status = COMMAND_STATUS_DEVICE_ERROR;
+                response->payloadLength =
+                    sprintf(response->payload, "{\"error\":\"response too large\"}");
+                return;
+            }
+
+            memcpy(response->payload, json, n + 1);
+            response->payloadLength = (uint16_t)n;
+            response->payload_is_full_body = true;
+            response->status = COMMAND_STATUS_OK;
+            free(json);
+            ESP_LOGI("AZURE", "Health snapshot: speaker=%s bell=ON",
+                     speaker_on ? "ON" : "OFF");
         }
 
         else if(_code == CMD_CODE_UPDATE_FIRMWARE) //code = 501

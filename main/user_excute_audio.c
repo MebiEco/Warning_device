@@ -10,6 +10,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <errno.h>
+#include <inttypes.h>
 
 static const char *TAG = "PLAYER";
 
@@ -108,10 +109,14 @@ void sd_read_task(void *pvParameters)
           }
         }
 
-        /* BT mode: need A2DP stream — don't block radio with huge SD read first */
+        /* BT mode: wait for A2DP before huge SD read (SD starves BT reconnect). */
         if (user_bluetooth_is_active()) {
-          if (!user_bluetooth_wait_for_media(20000)) {
-            ESP_LOGW(TAG, "A2DP not ready — alarm may be silent until speaker links");
+          uint32_t wait_ms = user_bluetooth_is_recovering() ? 90000 : 45000;
+          if (!user_bluetooth_wait_for_media(wait_ms)) {
+            ESP_LOGW(TAG, "A2DP not ready after %" PRIu32 " ms — skip play (avoid silent + RF storm)",
+                     wait_ms);
+            play_state = 0;
+            continue;
           }
         }
 
@@ -175,7 +180,14 @@ void sd_read_task(void *pvParameters)
               psram_audio_pos = 0;
               if (user_bluetooth_is_active() && !user_bluetooth_is_media_ready()) {
                 ESP_LOGW(TAG, "Loaded %s but A2DP still not streaming — waiting...", path);
-                (void)user_bluetooth_wait_for_media(10000);
+                if (!user_bluetooth_wait_for_media(user_bluetooth_is_recovering() ? 60000 : 20000)) {
+                  ESP_LOGW(TAG, "Still no A2DP — stop play until speaker links");
+                  is_playing = false;
+                  play_state = 0;
+                  psram_audio_len = 0;
+                  psram_audio_pos = 0;
+                  continue;
+                }
               }
               is_playing = true;
               ESP_LOGI(TAG, "Successfully loaded and playing: %s (%u bytes)", path, (unsigned)read_bytes);

@@ -1,0 +1,20 @@
+# ESP32-WROVER-E Custom Partition Table (4MB Flash, OTA only, no SPIFFS)
+#
+# Flash layout (total 4MB = 0x400000):
+#   0x000000 - 0x008FFF  Bootloader  (reserved)
+#   0x009000 - 0x00CFFF  NVS         (16KB)
+#   0x00D000 - 0x00EFFF  OTA Data    (8KB)  ← bootloader dùng để track slot đang chạy
+#   0x00F000 - 0x00FFFF  PHY Init    (4KB)
+#   0x010000 - 0x1FFFFF  ota_0       (1.9375MB = 0x1F0000) ← flash lần đầu
+#   0x200000 - 0x3EFFFF  ota_1       (1.9375MB = 0x1F0000) ← nhận firmware OTA
+#   0x3F0000 - 0x3FFFFF  (64KB dự phòng, không phân vùng)
+#
+# Tổng dùng: 0x3F0000 / 0x400000 ✓  (đủ cho app ~1.9MB)
+#
+# Name,     Type,  SubType,  Offset,    Size
+nvs,         data,  nvs,      0x9000,    0x4000,
+otadata,     data,  ota,      0xD000,    0x2000,
+phy_init,    data,  phy,      0xF000,    0x1000,
+factory,     app,   factory,  0x10000,   0x2M,
+ota_0,       app,   ota_0,    0x210000,  0x2M,
+ota_1,       app,   ota_1,    0x410000,  0x2M,

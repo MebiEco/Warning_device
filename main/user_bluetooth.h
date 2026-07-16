@@ -35,6 +35,8 @@ void user_bt_resume_after_wifi(void);
 bool user_bluetooth_is_active(void);
 /** A2DP connected and media stream started (can hear alarm). */
 bool user_bluetooth_is_media_ready(void);
+/** True while reconnecting after speaker was connected then dropped (power cycle). */
+bool user_bluetooth_is_recovering(void);
 /** Wait until media stream is up (or timeout). */
 bool user_bluetooth_wait_for_media(uint32_t timeout_ms);
 

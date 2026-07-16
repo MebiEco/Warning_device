@@ -45,6 +45,8 @@ typedef struct {
   CommandStatus_t status;
   char payload[1536];
   uint16_t payloadLength;
+  /** If true, payload is the full DM response JSON (e.g. Code 300 snapshot). */
+  bool payload_is_full_body;
 } DirectMethodResponse_t;
 
 void User_Azure_Task(void);

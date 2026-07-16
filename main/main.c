@@ -419,6 +419,8 @@ void Switch_Monitor_Task(void *pvParameters)
                     if (!sys_is_bt_mode)
                     {
                         ESP_LOGI(TAG, "Starting Bluetooth Mode...");
+                        /* Brief settle after DAC stop or BT deinit before controller bring-up */
+                        vTaskDelay(pdMS_TO_TICKS(500));
                         sys_is_bt_mode = true;
                         user_bluetooth_init();
                     }

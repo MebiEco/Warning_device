@@ -24,6 +24,8 @@
 #define CMD_CODE_LOA                 100  /* Play / stop alarm WAV */
 #define CMD_CODE_CONTROL_ON_OFF      101  /* Bell / siren GPIO */
 #define CMD_CODE_CONTROL_SCHEDULE    102  /* Reserved */
+#define CMD_CODE_GET_HEALTH_SNAPSHOT 106  /* GetDeviceHealthSnapshot */
+#define CMD_CODE_HEALTH_SNAPSHOT_RSP 300  /* Response Code for 106 */
 #define CMD_CODE_UPDATE_FIRMWARE     501  /* OTA */
 #define CMD_CODE_AUDIO_DOWNLOAD      600  /* HTTPS → SD */
 #define CMD_CODE_AUDIO_DELETE        601
@@ -42,6 +44,10 @@ typedef struct {
 } Sys_Info_Handle_t;
 
 extern Sys_Info_Handle_t Sys_Info;
+
+/* Audio mode flags (owned by main.c) */
+extern bool sys_is_dac_i2s_mode;
+extern bool sys_is_bt_mode;
 
 void User_System_Get_Config(void);
 

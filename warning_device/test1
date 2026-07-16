@@ -1,0 +1,19 @@
+Found a target device, address 74:45:ce:3b:e4:f9, name WF-XB700
+
+
+//Payload cho dieu khien chuong
+{
+  "Code": 102,
+  "Data": {
+    "Value": 1,
+    "Duration": 2,
+    "RestTime": 3,
+    "Repeat": 5
+  }
+}
+
+- "Code": 102
+- "Value": 1 (bat), 0 (tat)
+- "Duration": Thoi gian bat chuong bao (tinh bang giay)
+- "RestTime": Thoi gian nghi giua cac lan lap lai (tinh bang giay)
+- "Repeat": So lan lap lai, neu "Repeat" = 0 thi se lap lai mai mai

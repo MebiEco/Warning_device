@@ -20,7 +20,7 @@
 #include "esp_coexist.h"
 
 #include "user_excute_audio.h" // For bt_app_a2d_data_cb references (is_playing, psram_audio_buffer, etc.)
-#include "user_system.h"     // For User_System_Get_Bluetooth_Config references (get_bt_mac, get_bt_name, etc.)
+#include "user_system.h" // For User_System_Get_Bluetooth_Config references (get_bt_mac, get_bt_name, etc.)
 
 /* log tags */
 #define BT_AV_TAG "BT_AV"
@@ -32,8 +32,8 @@
 #define APP_RC_CT_TL_RN_VOLUME_CHANGE (1)
 
 enum {
-  BT_APP_STACK_UP_EVT = 0x0000,   
-  BT_APP_HEART_BEAT_EVT = 0xff00, 
+  BT_APP_STACK_UP_EVT = 0x0000,
+  BT_APP_HEART_BEAT_EVT = 0xff00,
 };
 
 enum {
@@ -55,10 +55,12 @@ enum {
 
 static void bt_av_hdl_stack_evt(uint16_t event, void *p_param);
 static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param);
-static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
+static void bt_app_gap_cb(esp_bt_gap_cb_event_t event,
+                          esp_bt_gap_cb_param_t *param);
 static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param);
 static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len);
-static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
+static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event,
+                            esp_avrc_ct_cb_param_t *param);
 static void bt_app_a2d_heart_beat(TimerHandle_t arg);
 static void bt_app_av_sm_hdlr(uint16_t event, void *param);
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size);
@@ -67,10 +69,10 @@ static void bt_app_av_state_connecting_hdlr(uint16_t event, void *param);
 static void bt_app_av_state_connected_hdlr(uint16_t event, void *param);
 static void bt_app_av_state_disconnecting_hdlr(uint16_t event, void *param);
 
-static esp_bd_addr_t s_peer_bda = {0}; 
-static uint8_t s_peer_bdname[ESP_BT_GAP_MAX_BDNAME_LEN + 1];            
-static int s_a2d_state = APP_AV_STATE_IDLE; 
-static int s_media_state = APP_AV_MEDIA_STATE_IDLE; 
+static esp_bd_addr_t s_peer_bda = {0};
+static uint8_t s_peer_bdname[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
+static int s_a2d_state = APP_AV_STATE_IDLE;
+static int s_media_state = APP_AV_MEDIA_STATE_IDLE;
 static int s_intv_cnt = 0;
 static int s_idle_heartbeat_cnt = 0;
 static int s_connecting_intv = 0;
@@ -87,97 +89,185 @@ static bool is_bt_initialized = false;
 static bool s_audio_cfg_received = false;
 static bool s_bt_shutting_down = false;
 static volatile bool s_bt_wifi_priority = false;
+static bool s_a2dp_profile_ready = false;
+static bool s_ble_mem_released = false;
+/* After A2DP drop while connected (speaker power cycle) — keep paging gently
+ * until back. */
+static bool s_recovering_speaker = false;
+/* True while GAP inquiry running — do not page. */
+static bool s_scan_active = false;
+/* Ignore stale A2DP DISCONNECTED for N heartbeats after esp_a2d_source_connect.
+ */
+static int s_connect_guard_hb = 0;
 
 #define BT_CONNECT_RETRY_MAX 10
 #define BT_RETRY_DELAY_HEARTBEATS 3
 #define BT_CONNECT_TIMEOUT_HEARTBEATS 6
+/* Speaker boot after power-on often needs >12s for full A2DP. */
+#define BT_RECOVER_CONNECT_TIMEOUT_HEARTBEATS 12
 /* Heartbeat timer = 2s. Nudge media ctrl every ~12s while idle. */
 #define BT_KEEPALIVE_HEARTBEATS 6
-/* Continuous soft tone — silence/short bursts still let AW-TREK auto-off (~10 min).
- * Amplitude ~peak sample (<< 32767). Lower = quieter; too low → speaker sleeps. */
-#define BT_IDLE_KEEPALIVE_AMP  40
+/* After SW3 off→on (esp. mid-page): wait ~8s so speaker / controller settle. */
+#define BT_REINIT_SETTLE_HEARTBEATS 4
+/* After 10 page timeouts: cool down ~30s then try again (do NOT stop forever).
+ */
+#define BT_RETRY_COOLDOWN_HEARTBEATS 15
+/* After speaker-off disconnect: wait ~10s before first page (speaker boot). */
+#define BT_SPEAKER_OFF_SETTLE_HEARTBEATS 5
+/* While recovering: space pages ~8s apart (avoid storm while speaker boots). */
+#define BT_SPEAKER_RECOVER_GAP_HEARTBEATS 4
+/* After web Save / scan cancel: wait before first page (inquiry radio settle).
+ */
+#define BT_POST_SCAN_SETTLE_HEARTBEATS 3
+/* Drop stale DISCONNECTED from previous page attempt. */
+#define BT_CONNECT_GUARD_HEARTBEATS 1
+/* Continuous soft tone — silence/short bursts still let AW-TREK auto-off (~10
+ * min). Amplitude ~peak sample (<< 32767). Lower = quieter; too low → speaker
+ * sleeps. */
+#define BT_IDLE_KEEPALIVE_AMP 10
 
 static bool s_avrc_connected = false;
 static uint32_t s_idle_phase = 0;
 
-static bool bt_is_peer_addr(const uint8_t *bda)
-{
+/** Clear flags left over from deinit / failed reconnect — required for SW3 hot
+ * re-init. */
+static void bt_reset_session_state(void) {
+  s_bt_shutting_down = false;
+  s_bt_wifi_priority = false;
+  s_a2dp_profile_ready = false;
+  s_recovering_speaker = false;
+  s_scan_active = false;
+  s_connect_guard_hb = 0;
+  s_a2d_state = APP_AV_STATE_IDLE;
+  s_media_state = APP_AV_MEDIA_STATE_IDLE;
+  s_avrc_connected = false;
+  s_audio_cfg_received = false;
+  s_bt_retry_count = 0;
+  s_bt_retry_delay_ticks = 0;
+  s_connecting_intv = 0;
+  s_idle_heartbeat_cnt = 0;
+  s_idle_phase = 0;
+  s_intv_cnt = 0;
+  s_pkt_cnt = 0;
+}
+
+static bool bt_is_peer_addr(const uint8_t *bda) {
   return bda && memcmp(bda, s_peer_bda, ESP_BD_ADDR_LEN) == 0;
 }
 
-static void bt_mark_connected(const char *via)
-{
+static void bt_mark_connected(const char *via) {
   ESP_LOGI(BT_AV_TAG, "[BT] ✓ Connected to: %s (%s)", s_peer_bdname, via);
   s_bt_retry_count = 0;
   s_bt_retry_delay_ticks = 0;
   s_connecting_intv = 0;
   s_idle_heartbeat_cnt = 0;
   s_idle_phase = 0;
+  s_recovering_speaker = false;
+  s_connect_guard_hb = 0;
   s_a2d_state = APP_AV_STATE_CONNECTED;
   s_media_state = APP_AV_MEDIA_STATE_IDLE;
   s_audio_cfg_received = false;
   esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
 }
 
-static void bt_schedule_reconnect(const char *reason)
-{
+static void bt_schedule_reconnect(const char *reason) {
   esp_a2d_source_disconnect(s_peer_bda);
   s_avrc_connected = false;
+  s_a2d_state = APP_AV_STATE_UNCONNECTED;
+  s_connecting_intv = 0;
 
-  if (s_bt_retry_count >= BT_CONNECT_RETRY_MAX) {
-    ESP_LOGE(BT_AV_TAG, "Failed to connect to %s after %d attempts.", s_peer_bdname, BT_CONNECT_RETRY_MAX);
-    s_a2d_state = APP_AV_STATE_UNCONNECTED;
-    s_connecting_intv = 0;
+  /* Speaker power-cycle recovery: keep trying forever with gentle spacing. */
+  if (s_recovering_speaker) {
+    s_bt_retry_count = 0;
+    s_bt_retry_delay_ticks = BT_SPEAKER_RECOVER_GAP_HEARTBEATS;
+    ESP_LOGW(BT_AV_TAG, "%s — recovering %s, next page in %d s", reason,
+             s_peer_bdname, BT_SPEAKER_RECOVER_GAP_HEARTBEATS * 2);
     return;
   }
 
   s_bt_retry_count++;
+  if (s_bt_retry_count >= BT_CONNECT_RETRY_MAX) {
+    ESP_LOGW(BT_AV_TAG,
+             "%s (%d/%d). Pause %d s then retry — do not need reboot; avoid "
+             "toggling SW mid-page",
+             reason, s_bt_retry_count, BT_CONNECT_RETRY_MAX,
+             BT_RETRY_COOLDOWN_HEARTBEATS * 2);
+    s_bt_retry_count = 0;
+    s_bt_retry_delay_ticks = BT_RETRY_COOLDOWN_HEARTBEATS;
+    return;
+  }
+
   s_bt_retry_delay_ticks = BT_RETRY_DELAY_HEARTBEATS;
-  s_a2d_state = APP_AV_STATE_UNCONNECTED;
-  s_connecting_intv = 0;
-  ESP_LOGW(BT_AV_TAG, "%s (%d/%d). Retry in %d s...",
-           reason, s_bt_retry_count, BT_CONNECT_RETRY_MAX,
-           BT_RETRY_DELAY_HEARTBEATS * 2);
+  ESP_LOGW(BT_AV_TAG, "%s (%d/%d). Retry in %d s...", reason, s_bt_retry_count,
+           BT_CONNECT_RETRY_MAX, BT_RETRY_DELAY_HEARTBEATS * 2);
 }
 
-/* Speaker powered off / link lost while previously connected — reconnect without burning retry budget */
-static void bt_on_speaker_lost(const char *reason)
-{
+/* Link lost while connected, or ACL dropped mid-connect — schedule retry
+ * without panicking. */
+static void bt_on_speaker_lost(const char *reason) {
   if (s_bt_shutting_down || s_bt_wifi_priority) {
     s_avrc_connected = false;
     s_media_state = APP_AV_MEDIA_STATE_IDLE;
     s_a2d_state = APP_AV_STATE_UNCONNECTED;
     return;
   }
-  ESP_LOGW(BT_AV_TAG, "[BT] %s (%s) — will reconnect when speaker is on", reason, s_peer_bdname);
+
+  const bool was_connected = (s_a2d_state == APP_AV_STATE_CONNECTED);
+  const bool mid_connect = (s_a2d_state == APP_AV_STATE_CONNECTING);
+
+  if (mid_connect) {
+    ESP_LOGW(BT_AV_TAG, "[BT] %s during connect to %s — retry shortly", reason,
+             s_peer_bdname);
+    esp_a2d_source_disconnect(s_peer_bda);
+  } else if (was_connected) {
+    /* Speaker off / out of range — page forever until it returns. */
+    s_recovering_speaker = true;
+    esp_coex_preference_set(ESP_COEX_PREFER_BT);
+    ESP_LOGW(
+        BT_AV_TAG,
+        "[BT] %s (%s) — speaker recovery ON (page every ~%ds after %ds settle)",
+        reason, s_peer_bdname, BT_SPEAKER_RECOVER_GAP_HEARTBEATS * 2,
+        BT_SPEAKER_OFF_SETTLE_HEARTBEATS * 2);
+  } else {
+    ESP_LOGW(BT_AV_TAG, "[BT] %s (%s) — will reconnect", reason, s_peer_bdname);
+  }
+
   s_avrc_connected = false;
   s_media_state = APP_AV_MEDIA_STATE_IDLE;
   s_audio_cfg_received = false;
   s_idle_heartbeat_cnt = 0;
   s_connecting_intv = 0;
 
-  /* Mid reconnect: do not reset retry / reconnect every ~2s (Bluedroid OOM crash). */
-  if (s_a2d_state == APP_AV_STATE_CONNECTING || s_a2d_state == APP_AV_STATE_UNCONNECTED) {
+  /* Mid reconnect: do not reset retry / reconnect every ~2s (Bluedroid OOM
+   * crash). */
+  if (mid_connect || s_a2d_state == APP_AV_STATE_UNCONNECTED) {
     if (s_bt_retry_delay_ticks < BT_RETRY_DELAY_HEARTBEATS) {
       s_bt_retry_delay_ticks = BT_RETRY_DELAY_HEARTBEATS;
+    }
+    if (s_recovering_speaker &&
+        s_bt_retry_delay_ticks < BT_SPEAKER_RECOVER_GAP_HEARTBEATS) {
+      s_bt_retry_delay_ticks = BT_SPEAKER_RECOVER_GAP_HEARTBEATS;
     }
     s_a2d_state = APP_AV_STATE_UNCONNECTED;
     return;
   }
 
   s_bt_retry_count = 0;
-  s_bt_retry_delay_ticks = BT_RETRY_DELAY_HEARTBEATS * 2; /* ~12 s */
+  s_bt_retry_delay_ticks = s_recovering_speaker
+                               ? BT_SPEAKER_OFF_SETTLE_HEARTBEATS
+                               : (BT_RETRY_DELAY_HEARTBEATS * 2);
   s_a2d_state = APP_AV_STATE_UNCONNECTED;
 }
 
-static void bt_fill_idle_audio(uint8_t *data, int32_t len)
-{
+static void bt_fill_idle_audio(uint8_t *data, int32_t len) {
   /* Continuous soft ~220 Hz — required to stop AW-TREK silence auto-off. */
   int16_t *samples = (int16_t *)data;
   int n = len / (int)sizeof(int16_t);
   const uint32_t step = 326;
   for (int i = 0; i < n; i += 2) {
-    int16_t v = (int16_t)((((int32_t)(int16_t)s_idle_phase) * BT_IDLE_KEEPALIVE_AMP) >> 15);
+    int16_t v =
+        (int16_t)((((int32_t)(int16_t)s_idle_phase) * BT_IDLE_KEEPALIVE_AMP) >>
+                  15);
     samples[i] = v;
     if (i + 1 < n) {
       samples[i + 1] = v;
@@ -186,8 +276,7 @@ static void bt_fill_idle_audio(uint8_t *data, int32_t len)
   }
 }
 
-static void bt_nudge_stream_keepalive(void)
-{
+static void bt_nudge_stream_keepalive(void) {
   if (s_bt_wifi_priority || s_a2d_state != APP_AV_STATE_CONNECTED) {
     return;
   }
@@ -199,24 +288,28 @@ static void bt_nudge_stream_keepalive(void)
   }
 }
 
-static void bt_begin_connect(void)
-{
-  if (s_bt_wifi_priority) {
+static void bt_begin_connect(void) {
+  if (s_bt_wifi_priority || s_bt_shutting_down || s_scan_active) {
     return;
   }
-  if (s_a2d_state == APP_AV_STATE_CONNECTED || s_a2d_state == APP_AV_STATE_CONNECTING) {
+  if (!s_a2dp_profile_ready) {
+    ESP_LOGW(BT_AV_TAG, "[BT] A2DP profile not ready — defer connect");
+    return;
+  }
+  if (s_a2d_state == APP_AV_STATE_CONNECTED ||
+      s_a2d_state == APP_AV_STATE_CONNECTING) {
     return;
   }
   esp_coex_preference_set(ESP_COEX_PREFER_BT);
   s_avrc_connected = false;
+  s_connect_guard_hb = BT_CONNECT_GUARD_HEARTBEATS;
   esp_a2d_source_connect(s_peer_bda);
   s_a2d_state = APP_AV_STATE_CONNECTING;
   s_connecting_intv = 0;
   s_audio_cfg_received = false;
 }
 
-void user_bt_pause_for_wifi(void)
-{
+void user_bt_pause_for_wifi(void) {
   esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
   if (s_bt_wifi_priority) {
     return;
@@ -243,8 +336,7 @@ void user_bt_pause_for_wifi(void)
   vTaskDelay(pdMS_TO_TICKS(400));
 }
 
-void user_bt_resume_after_wifi(void)
-{
+void user_bt_resume_after_wifi(void) {
   if (!s_bt_wifi_priority) {
     return;
   }
@@ -257,7 +349,8 @@ void user_bt_resume_after_wifi(void)
   /* Reconnect soon — do not burn retry budget for intentional pause */
   s_bt_retry_count = 0;
   s_bt_retry_delay_ticks = 1;
-  if (s_a2d_state != APP_AV_STATE_CONNECTED && s_a2d_state != APP_AV_STATE_CONNECTING) {
+  if (s_a2d_state != APP_AV_STATE_CONNECTED &&
+      s_a2d_state != APP_AV_STATE_CONNECTING) {
     s_a2d_state = APP_AV_STATE_UNCONNECTED;
   }
 }
@@ -266,8 +359,7 @@ void user_bt_resume_after_wifi(void)
 #define NVS_BT_MAC_KEY "bt_mac"
 #define NVS_BT_NAME_KEY "bt_name"
 
-void save_bt_device_to_nvs(esp_bd_addr_t bda, const char *name)
-{
+void save_bt_device_to_nvs(esp_bd_addr_t bda, const char *name) {
   nvs_handle_t my_handle;
   esp_err_t err = nvs_open(NVS_BT_NAMESPACE, NVS_READWRITE, &my_handle);
   if (err != ESP_OK)
@@ -280,8 +372,7 @@ void save_bt_device_to_nvs(esp_bd_addr_t bda, const char *name)
   ESP_LOGI(BT_AV_TAG, "Saved BT device to NVS: %s", name);
 }
 
-bool load_bt_device_from_nvs(esp_bd_addr_t bda, char *name)
-{
+bool load_bt_device_from_nvs(esp_bd_addr_t bda, char *name) {
   nvs_handle_t my_handle;
   esp_err_t err = nvs_open(NVS_BT_NAMESPACE, NVS_READONLY, &my_handle);
   if (err != ESP_OK)
@@ -289,8 +380,7 @@ bool load_bt_device_from_nvs(esp_bd_addr_t bda, char *name)
 
   size_t required_size = ESP_BD_ADDR_LEN;
   err = nvs_get_blob(my_handle, NVS_BT_MAC_KEY, bda, &required_size);
-  if (err != ESP_OK)
-  {
+  if (err != ESP_OK) {
     nvs_close(my_handle);
     return false;
   }
@@ -301,51 +391,60 @@ bool load_bt_device_from_nvs(esp_bd_addr_t bda, char *name)
   return err == ESP_OK;
 }
 
-void start_bt_device_scan(void)
-{
+void start_bt_device_scan(void) {
   discovered_devices_count = 0;
   memset(discovered_devices, 0, sizeof(discovered_devices));
-  is_manual_connect_requested = false;   
-  s_bt_retry_count = 999;                
-  esp_a2d_source_disconnect(s_peer_bda); 
+  is_manual_connect_requested = false;
+  s_scan_active = true;
+  s_bt_retry_count = 0;
+  s_bt_retry_delay_ticks = 0;
+  /* Stop any in-flight page so inquiry can use the radio */
+  if (s_a2d_state == APP_AV_STATE_CONNECTING ||
+      s_a2d_state == APP_AV_STATE_CONNECTED) {
+    esp_a2d_source_disconnect(s_peer_bda);
+  }
 
   ESP_LOGI(BT_AV_TAG, "Starting device discovery manually...");
   s_a2d_state = APP_AV_STATE_DISCOVERING;
   esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
 }
 
-void connect_to_bt_device(uint8_t *mac_addr, const char *name)
-{
+void connect_to_bt_device(uint8_t *mac_addr, const char *name) {
   memcpy(s_peer_bda, mac_addr, ESP_BD_ADDR_LEN);
-  if (name != NULL)
-  {
+  if (name != NULL) {
     strncpy((char *)s_peer_bdname, name, ESP_BT_GAP_MAX_BDNAME_LEN);
     save_bt_device_to_nvs(s_peer_bda, name);
   }
   ESP_LOGI(BT_AV_TAG, "Device selected and saved. Canceling discovery...");
-  
-  /* We just cancel discovery. We will NOT change state to APP_AV_STATE_DISCOVERED 
-     because we don't want it to actually connect in Config Mode. */
+
+  /* We just cancel discovery. We will NOT change state to
+     APP_AV_STATE_DISCOVERED because we don't want it to actually connect in
+     Config Mode. */
   esp_bt_gap_cancel_discovery();
 }
 
-static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
-{
-  if (bda == NULL || str == NULL || size < 18) { return NULL; }
-  sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x", bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+static char *bda2str(esp_bd_addr_t bda, char *str, size_t size) {
+  if (bda == NULL || str == NULL || size < 18) {
+    return NULL;
+  }
+  sprintf(str, "%02x:%02x:%02x:%02x:%02x:%02x", bda[0], bda[1], bda[2], bda[3],
+          bda[4], bda[5]);
   return str;
 }
 
-static bool get_name_from_eir(uint8_t *eir, uint8_t *bdname, uint8_t *bdname_len)
-{
+static bool get_name_from_eir(uint8_t *eir, uint8_t *bdname,
+                              uint8_t *bdname_len) {
   uint8_t *rmt_bdname = NULL;
   uint8_t rmt_bdname_len = 0;
 
-  if (!eir) return false;
+  if (!eir)
+    return false;
 
-  rmt_bdname = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &rmt_bdname_len);
+  rmt_bdname = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME,
+                                           &rmt_bdname_len);
   if (!rmt_bdname) {
-    rmt_bdname = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &rmt_bdname_len);
+    rmt_bdname = esp_bt_gap_resolve_eir_data(
+        eir, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &rmt_bdname_len);
   }
 
   if (rmt_bdname) {
@@ -356,26 +455,25 @@ static bool get_name_from_eir(uint8_t *eir, uint8_t *bdname, uint8_t *bdname_len
       memcpy(bdname, rmt_bdname, rmt_bdname_len);
       bdname[rmt_bdname_len] = '\0';
     }
-    if (bdname_len) *bdname_len = rmt_bdname_len;
+    if (bdname_len)
+      *bdname_len = rmt_bdname_len;
     return true;
   }
   return false;
 }
 
-static void filter_inquiry_scan_result(esp_bt_gap_cb_param_t *param)
-{
+static void filter_inquiry_scan_result(esp_bt_gap_cb_param_t *param) {
   char bda_str[18];
-  uint32_t cod = 0;    
-  int32_t rssi = -129; 
+  uint32_t cod = 0;
+  int32_t rssi = -129;
   uint8_t *eir = NULL;
   esp_bt_gap_dev_prop_t *p;
 
-  ESP_LOGI(BT_AV_TAG, "Scanned device: %s", bda2str(param->disc_res.bda, bda_str, 18));
-  for (int i = 0; i < param->disc_res.num_prop; i++)
-  {
+  ESP_LOGI(BT_AV_TAG, "Scanned device: %s",
+           bda2str(param->disc_res.bda, bda_str, 18));
+  for (int i = 0; i < param->disc_res.num_prop; i++) {
     p = param->disc_res.prop + i;
-    switch (p->type)
-    {
+    switch (p->type) {
     case ESP_BT_GAP_DEV_PROP_COD:
       cod = *(uint32_t *)(p->val);
       ESP_LOGI(BT_AV_TAG, "--Class of Device: 0x%" PRIx32, cod);
@@ -402,18 +500,20 @@ static void filter_inquiry_scan_result(esp_bt_gap_cb_param_t *param)
     strcpy(device_name, "Unknown Device");
   }
 
-  if (discovered_devices_count < MAX_DISCOVERED_DEVICES)
-  {
+  if (discovered_devices_count < MAX_DISCOVERED_DEVICES) {
     bool duplicate = false;
     for (int i = 0; i < discovered_devices_count; i++) {
-      if (memcmp(discovered_devices[i].bda, param->disc_res.bda, ESP_BD_ADDR_LEN) == 0) {
+      if (memcmp(discovered_devices[i].bda, param->disc_res.bda,
+                 ESP_BD_ADDR_LEN) == 0) {
         duplicate = true;
         break;
       }
     }
     if (!duplicate) {
-      memcpy(discovered_devices[discovered_devices_count].bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
-      strncpy(discovered_devices[discovered_devices_count].bdname, device_name, ESP_BT_GAP_MAX_BDNAME_LEN);
+      memcpy(discovered_devices[discovered_devices_count].bda,
+             param->disc_res.bda, ESP_BD_ADDR_LEN);
+      strncpy(discovered_devices[discovered_devices_count].bdname, device_name,
+              ESP_BT_GAP_MAX_BDNAME_LEN);
       discovered_devices[discovered_devices_count].is_used = true;
       discovered_devices_count++;
       ESP_LOGI(BT_AV_TAG, "Discovered device: %s (%s)", bda_str, device_name);
@@ -421,67 +521,79 @@ static void filter_inquiry_scan_result(esp_bt_gap_cb_param_t *param)
   }
 }
 
-static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
-{
-  switch (event)
-  {
-  case ESP_BT_GAP_DISC_RES_EVT:
-  {
-    if (s_a2d_state == APP_AV_STATE_DISCOVERING) { filter_inquiry_scan_result(param); }
+static void bt_app_gap_cb(esp_bt_gap_cb_event_t event,
+                          esp_bt_gap_cb_param_t *param) {
+  switch (event) {
+  case ESP_BT_GAP_DISC_RES_EVT: {
+    if (s_a2d_state == APP_AV_STATE_DISCOVERING) {
+      filter_inquiry_scan_result(param);
+    }
     break;
   }
-  case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
-  {
+  case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
     if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
       ESP_LOGI(BT_AV_TAG, "Device discovery stopped.");
-      if (is_manual_connect_requested && s_a2d_state == APP_AV_STATE_DISCOVERED) {
+      s_scan_active = false;
+      if (is_manual_connect_requested &&
+          s_a2d_state == APP_AV_STATE_DISCOVERED) {
         ESP_LOGI(BT_AV_TAG, "a2dp connecting to manual peer.");
         bt_begin_connect();
       } else if (s_peer_bdname[0] != '\0') {
-        /* Web/manual scan ends here — leave IDLE and resume auto-reconnect */
+        /* After inquiry: settle before page — too soon → Connection failed /
+         * ACL drop */
         s_bt_retry_count = 0;
-        s_bt_retry_delay_ticks = 1;
+        s_bt_retry_delay_ticks = BT_POST_SCAN_SETTLE_HEARTBEATS;
         s_a2d_state = APP_AV_STATE_UNCONNECTED;
-        ESP_LOGI(BT_AV_TAG, "Scan finished. Resuming reconnect to %s", s_peer_bdname);
+        ESP_LOGI(BT_AV_TAG, "Scan finished. Will reconnect to %s in ~%ds",
+                 s_peer_bdname, BT_POST_SCAN_SETTLE_HEARTBEATS * 2);
       } else {
         s_a2d_state = APP_AV_STATE_IDLE;
         ESP_LOGI(BT_AV_TAG, "Scan finished. Idle state.");
       }
     } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
+      s_scan_active = true;
       ESP_LOGI(BT_AV_TAG, "Discovery started.");
     }
     break;
   }
-  case ESP_BT_GAP_AUTH_CMPL_EVT:
-  {
+  case ESP_BT_GAP_AUTH_CMPL_EVT: {
     if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
-      ESP_LOGI(BT_AV_TAG, "[BT] ✓ Pairing success with: %s", param->auth_cmpl.device_name);
+      ESP_LOGI(BT_AV_TAG, "[BT] ✓ Pairing success with: %s",
+               param->auth_cmpl.device_name);
     } else {
-      ESP_LOGE(BT_AV_TAG, "[BT] Pairing failed with status: %d", param->auth_cmpl.stat);
+      ESP_LOGE(BT_AV_TAG, "[BT] Pairing failed with status: %d",
+               param->auth_cmpl.stat);
     }
     break;
   }
-  case ESP_BT_GAP_PIN_REQ_EVT:
-  {
+  case ESP_BT_GAP_PIN_REQ_EVT: {
     if (param->pin_req.min_16_digit) {
-      ESP_LOGI(BT_AV_TAG, "[BT] PIN requested (16-digit). Replying with zeros.");
+      ESP_LOGI(BT_AV_TAG,
+               "[BT] PIN requested (16-digit). Replying with zeros.");
       esp_bt_pin_code_t pin_code = {0};
       esp_bt_gap_pin_reply(param->pin_req.bda, true, 16, pin_code);
     } else {
       ESP_LOGI(BT_AV_TAG, "[BT] PIN requested. Replying with 0000.");
       esp_bt_pin_code_t pin_code;
-      pin_code[0] = '0'; pin_code[1] = '0'; pin_code[2] = '0'; pin_code[3] = '0';
+      pin_code[0] = '0';
+      pin_code[1] = '0';
+      pin_code[2] = '0';
+      pin_code[3] = '0';
       esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin_code);
     }
     break;
   }
 #if (CONFIG_EXAMPLE_SSP_ENABLED == true)
   case ESP_BT_GAP_CFM_REQ_EVT:
-    ESP_LOGI(BT_AV_TAG, "ESP_BT_GAP_CFM_REQ_EVT Please compare the numeric value: %06" PRIu32, param->cfm_req.num_val);
+    ESP_LOGI(
+        BT_AV_TAG,
+        "ESP_BT_GAP_CFM_REQ_EVT Please compare the numeric value: %06" PRIu32,
+        param->cfm_req.num_val);
     esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
     break;
   case ESP_BT_GAP_KEY_NOTIF_EVT:
-    ESP_LOGI(BT_AV_TAG, "ESP_BT_GAP_KEY_NOTIF_EVT passkey: %06" PRIu32, param->key_notif.passkey);
+    ESP_LOGI(BT_AV_TAG, "ESP_BT_GAP_KEY_NOTIF_EVT passkey: %06" PRIu32,
+             param->key_notif.passkey);
     break;
   case ESP_BT_GAP_KEY_REQ_EVT:
     ESP_LOGI(BT_AV_TAG, "ESP_BT_GAP_KEY_REQ_EVT Please enter passkey!");
@@ -490,16 +602,28 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
   case ESP_BT_GAP_MODE_CHG_EVT:
     /* Power mode change (active/sniff/park) - suppress noisy log */
     break;
-  case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
-  {
+  case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT: {
+    if (param->acl_conn_cmpl_stat.stat == ESP_BT_STATUS_SUCCESS) {
+      char bda_str[18];
+      ESP_LOGI(
+          BT_AV_TAG, "[BT] ACL up: %s",
+          bda2str(param->acl_conn_cmpl_stat.bda, bda_str, sizeof(bda_str)));
+      break;
+    }
     if (param->acl_conn_cmpl_stat.stat != ESP_BT_STATUS_SUCCESS) {
       int st = param->acl_conn_cmpl_stat.stat;
-      ESP_LOGW(BT_AV_TAG, "[BT] ACL connect failed to %02x:%02x:%02x:%02x:%02x:%02x, status=%d",
-               param->acl_conn_cmpl_stat.bda[0], param->acl_conn_cmpl_stat.bda[1],
-               param->acl_conn_cmpl_stat.bda[2], param->acl_conn_cmpl_stat.bda[3],
-               param->acl_conn_cmpl_stat.bda[4], param->acl_conn_cmpl_stat.bda[5], st);
+      ESP_LOGW(
+          BT_AV_TAG,
+          "[BT] ACL connect failed to %02x:%02x:%02x:%02x:%02x:%02x, status=%d",
+          param->acl_conn_cmpl_stat.bda[0], param->acl_conn_cmpl_stat.bda[1],
+          param->acl_conn_cmpl_stat.bda[2], param->acl_conn_cmpl_stat.bda[3],
+          param->acl_conn_cmpl_stat.bda[4], param->acl_conn_cmpl_stat.bda[5],
+          st);
       if (st == (int)ESP_BT_STATUS_HCI_PAGE_TIMEOUT) {
-        ESP_LOGW(BT_AV_TAG, "[BT] Speaker may be OFF — turn on AW-TREK 12 and disconnect phone BT");
+        ESP_LOGW(BT_AV_TAG,
+                 "[BT] Page timeout — turn on %s, disconnect phone BT, or "
+                 "reboot ESP if just toggled SW3",
+                 s_peer_bdname[0] ? (char *)s_peer_bdname : "speaker");
       }
       if (bt_is_peer_addr(param->acl_conn_cmpl_stat.bda) &&
           s_a2d_state == APP_AV_STATE_CONNECTING) {
@@ -508,17 +632,18 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
     }
     break;
   }
-  case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
-  {
+  case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT: {
     if (bt_is_peer_addr(param->acl_disconn_cmpl_stat.bda) &&
-        (s_a2d_state == APP_AV_STATE_CONNECTED || s_a2d_state == APP_AV_STATE_CONNECTING)) {
+        (s_a2d_state == APP_AV_STATE_CONNECTED ||
+         s_a2d_state == APP_AV_STATE_CONNECTING)) {
       bt_on_speaker_lost("ACL disconnected");
     }
     break;
   }
   case ESP_BT_GAP_GET_DEV_NAME_CMPL_EVT:
     if (param->get_dev_name_cmpl.status == ESP_BT_STATUS_SUCCESS) {
-      ESP_LOGI(BT_AV_TAG, "[BT] Local device name: %s", param->get_dev_name_cmpl.name);
+      ESP_LOGI(BT_AV_TAG, "[BT] Local device name: %s",
+               param->get_dev_name_cmpl.name);
     } else {
       ESP_LOGW(BT_AV_TAG, "[BT] Failed to get local device name");
     }
@@ -530,35 +655,35 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
   return;
 }
 
-static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
-{
+static void bt_av_hdl_stack_evt(uint16_t event, void *p_param) {
   ESP_LOGD(BT_AV_TAG, "%s event: %d", __func__, event);
-  switch (event)
-  {
-  case BT_APP_STACK_UP_EVT:
-  {
+  switch (event) {
+  case BT_APP_STACK_UP_EVT: {
     char *dev_name = LOCAL_DEVICE_NAME;
     esp_bt_gap_set_device_name(dev_name);
-    
-    /* Set Class of Device to Audio/Video Source to prevent rejection by some headphones */
+
+    /* Set Class of Device to Audio/Video Source to prevent rejection by some
+     * headphones */
     esp_bt_cod_t cod;
     cod.major = ESP_BT_COD_MAJOR_DEV_AV;
     cod.minor = 0;
     cod.service = ESP_BT_COD_SRVC_AUDIO;
     esp_bt_gap_set_cod(cod, ESP_BT_INIT_COD);
-    
+
     esp_bt_gap_register_callback(bt_app_gap_cb);
 
     esp_avrc_ct_init();
     esp_avrc_ct_register_callback(bt_app_rc_ct_cb);
 
     esp_avrc_rn_evt_cap_mask_t evt_set = {0};
-    esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_set, ESP_AVRC_RN_VOLUME_CHANGE);
+    esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_set,
+                                       ESP_AVRC_RN_VOLUME_CHANGE);
     ESP_ERROR_CHECK(esp_avrc_tg_set_rn_evt_cap(&evt_set));
 
-    esp_a2d_source_init();
+    /* Register before init — otherwise ESP_A2D_INIT_SUCCESS may be dropped */
     esp_a2d_register_callback(&bt_app_a2d_cb);
     esp_a2d_source_register_data_callback(bt_app_a2d_data_cb);
+    esp_a2d_source_init();
 
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
     esp_bt_gap_get_device_name();
@@ -568,23 +693,29 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
       ESP_LOGI(BT_AV_TAG, "Found saved device: %s", s_peer_bdname);
       s_bt_retry_count = 0;
       s_a2d_state = APP_AV_STATE_UNCONNECTED;
-      /* NTP đã xong trước BT — kết nối ngay, không chờ heartbeat 10s */
-      if (Sys_Info.isTimeSync) {
-        char bda_str[18];
-        ESP_LOGI(BT_AV_TAG, "[BT] Connecting now to: %s [%s]",
-                 s_peer_bdname, bda2str(s_peer_bda, bda_str, sizeof(bda_str)));
-        bt_begin_connect();
-      } else {
+      /*
+       * Do NOT connect immediately: esp_a2d_source_init() is async.
+       * Hot SW3 re-init also needs settle time so the speaker drops the old
+       * ACL. Heartbeat will connect once A2DP is ready + delay expires.
+       */
+      s_bt_retry_delay_ticks = BT_REINIT_SETTLE_HEARTBEATS;
+      if (!Sys_Info.isTimeSync) {
         ESP_LOGI(BT_AV_TAG, "Deferring connection until Time Sync...");
+      } else {
+        ESP_LOGI(BT_AV_TAG,
+                 "[BT] Will connect to %s after A2DP ready + settle (~%ds)",
+                 s_peer_bdname, BT_REINIT_SETTLE_HEARTBEATS * 2);
       }
     } else {
-      ESP_LOGI(BT_AV_TAG, "No saved BT device. Waiting for manual scan request.");
+      ESP_LOGI(BT_AV_TAG,
+               "No saved BT device. Waiting for manual scan request.");
     }
 
     do {
       int tmr_id = 0;
       /* 2s heartbeat — reconnect nhanh hơn (trước 10s) */
-      s_tmr = xTimerCreate("connTmr", (2000 / portTICK_PERIOD_MS), pdTRUE, (void *)&tmr_id, bt_app_a2d_heart_beat);
+      s_tmr = xTimerCreate("connTmr", (2000 / portTICK_PERIOD_MS), pdTRUE,
+                           (void *)&tmr_id, bt_app_a2d_heart_beat);
       xTimerStart(s_tmr, portMAX_DELAY);
     } while (0);
     break;
@@ -595,21 +726,30 @@ static void bt_av_hdl_stack_evt(uint16_t event, void *p_param)
   }
 }
 
-static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
-{
-  bt_app_work_dispatch(bt_app_av_sm_hdlr, event, param, sizeof(esp_a2d_cb_param_t), NULL);
+static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
+  bt_app_work_dispatch(bt_app_av_sm_hdlr, event, param,
+                       sizeof(esp_a2d_cb_param_t), NULL);
 }
 
-static void bt_app_a2d_heart_beat(TimerHandle_t arg)
-{
+static void bt_app_a2d_heart_beat(TimerHandle_t arg) {
   bt_app_work_dispatch(bt_app_av_sm_hdlr, BT_APP_HEART_BEAT_EVT, NULL, 0, NULL);
 }
 
-static void bt_app_av_sm_hdlr(uint16_t event, void *param)
-{
+static void bt_app_av_sm_hdlr(uint16_t event, void *param) {
+  if (event == ESP_A2D_PROF_STATE_EVT) {
+    esp_a2d_cb_param_t *a2d = (esp_a2d_cb_param_t *)param;
+    if (a2d->a2d_prof_stat.init_state == ESP_A2D_INIT_SUCCESS) {
+      s_a2dp_profile_ready = true;
+      ESP_LOGI(BT_AV_TAG, "[BT] A2DP profile ready");
+    } else {
+      s_a2dp_profile_ready = false;
+      ESP_LOGI(BT_AV_TAG, "[BT] A2DP profile deinitialized");
+    }
+    return;
+  }
+
   /* Suppress noisy heartbeat logs; only log if an interesting event occurs */
-  switch (s_a2d_state)
-  {
+  switch (s_a2d_state) {
   case APP_AV_STATE_IDLE:
     /* No peer / waiting for scan — ignore heartbeats quietly */
     break;
@@ -634,11 +774,9 @@ static void bt_app_av_sm_hdlr(uint16_t event, void *param)
   }
 }
 
-static void bt_app_av_state_unconnected_hdlr(uint16_t event, void *param)
-{
+static void bt_app_av_state_unconnected_hdlr(uint16_t event, void *param) {
   esp_a2d_cb_param_t *a2d = NULL;
-  switch (event)
-  {
+  switch (event) {
   case ESP_A2D_CONNECTION_STATE_EVT:
   case ESP_A2D_AUDIO_STATE_EVT:
   case ESP_A2D_AUDIO_CFG_EVT:
@@ -646,26 +784,32 @@ static void bt_app_av_state_unconnected_hdlr(uint16_t event, void *param)
   case ESP_A2D_PROF_STATE_EVT:
     break;
   case BT_APP_HEART_BEAT_EVT:
-    if (s_bt_wifi_priority) {
-        break;
+    if (s_bt_wifi_priority || s_bt_shutting_down || s_scan_active) {
+      break;
     }
     if (!Sys_Info.isTimeSync) {
-        ESP_LOGW(BT_AV_TAG, "[BT] Waiting for NTP time sync before connecting...");
-        break;
+      ESP_LOGW(BT_AV_TAG,
+               "[BT] Waiting for NTP time sync before connecting...");
+      break;
     }
-    if (s_bt_retry_count >= BT_CONNECT_RETRY_MAX) {
-        break;
+    if (!s_a2dp_profile_ready) {
+      break;
     }
     if (s_bt_retry_delay_ticks > 0) {
-        s_bt_retry_delay_ticks--;
-        break;
+      s_bt_retry_delay_ticks--;
+      break;
     }
     char bda_str[18];
-    ESP_LOGI(BT_AV_TAG, "[BT] Connecting to saved device: %s [%s]", s_peer_bdname, bda2str(s_peer_bda, bda_str, sizeof(bda_str)));
+    if (s_recovering_speaker) {
+      ESP_LOGI(BT_AV_TAG, "[BT] Recovery page → %s [%s]", s_peer_bdname,
+               bda2str(s_peer_bda, bda_str, sizeof(bda_str)));
+    } else {
+      ESP_LOGI(BT_AV_TAG, "[BT] Connecting to saved device: %s [%s]",
+               s_peer_bdname, bda2str(s_peer_bda, bda_str, sizeof(bda_str)));
+    }
     bt_begin_connect();
     break;
-  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT:
-  {
+  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
     ESP_LOGD(BT_AV_TAG, "%s, stale delay report ignored: %u * 1/10 ms",
              __func__, a2d->a2d_report_delay_value_stat.delay_value);
@@ -677,17 +821,19 @@ static void bt_app_av_state_unconnected_hdlr(uint16_t event, void *param)
   }
 }
 
-static void bt_app_av_state_connecting_hdlr(uint16_t event, void *param)
-{
+static void bt_app_av_state_connecting_hdlr(uint16_t event, void *param) {
   esp_a2d_cb_param_t *a2d = NULL;
-  switch (event)
-  {
-  case ESP_A2D_CONNECTION_STATE_EVT:
-  {
+  switch (event) {
+  case ESP_A2D_CONNECTION_STATE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
       bt_mark_connected("A2DP state");
     } else if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+      if (s_connect_guard_hb > 0) {
+        ESP_LOGW(BT_AV_TAG, "[BT] Ignoring stale A2DP disconnect (guard=%d)",
+                 s_connect_guard_hb);
+        break;
+      }
       bt_schedule_reconnect("Connection failed");
     }
     break;
@@ -698,6 +844,9 @@ static void bt_app_av_state_connecting_hdlr(uint16_t event, void *param)
   case ESP_A2D_PROF_STATE_EVT:
     break;
   case BT_APP_HEART_BEAT_EVT:
+    if (s_connect_guard_hb > 0) {
+      s_connect_guard_hb--;
+    }
     if (s_bt_wifi_priority) {
       break;
     }
@@ -712,17 +861,28 @@ static void bt_app_av_state_connecting_hdlr(uint16_t event, void *param)
         break;
       }
       /* AVRC alone is not enough — keep waiting longer for A2DP */
-      if (++s_connecting_intv >= (BT_CONNECT_TIMEOUT_HEARTBEATS * 2)) {
-        bt_schedule_reconnect("AVRC only, A2DP not ready");
+      int timeout_hb = s_recovering_speaker
+                           ? BT_RECOVER_CONNECT_TIMEOUT_HEARTBEATS
+                           : BT_CONNECT_TIMEOUT_HEARTBEATS;
+      if (s_avrc_connected) {
+        timeout_hb *= 2;
+      }
+      if (++s_connecting_intv >= timeout_hb) {
+        bt_schedule_reconnect(s_avrc_connected ? "AVRC only, A2DP not ready"
+                                               : "Connection timeout");
       }
       break;
     }
-    if (++s_connecting_intv >= BT_CONNECT_TIMEOUT_HEARTBEATS) {
-      bt_schedule_reconnect("Connection timeout");
+    {
+      int timeout_hb = s_recovering_speaker
+                           ? BT_RECOVER_CONNECT_TIMEOUT_HEARTBEATS
+                           : BT_CONNECT_TIMEOUT_HEARTBEATS;
+      if (++s_connecting_intv >= timeout_hb) {
+        bt_schedule_reconnect("Connection timeout");
+      }
     }
     break;
-  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT:
-  {
+  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
     ESP_LOGI(BT_AV_TAG, "%s, delay value: %u * 1/10 ms", __func__,
              a2d->a2d_report_delay_value_stat.delay_value);
@@ -735,13 +895,10 @@ static void bt_app_av_state_connecting_hdlr(uint16_t event, void *param)
   }
 }
 
-static void bt_app_av_media_proc(uint16_t event, void *param)
-{
+static void bt_app_av_media_proc(uint16_t event, void *param) {
   esp_a2d_cb_param_t *a2d = NULL;
-  switch (s_media_state)
-  {
-  case APP_AV_MEDIA_STATE_IDLE:
-  {
+  switch (s_media_state) {
+  case APP_AV_MEDIA_STATE_IDLE: {
     if (s_bt_wifi_priority) {
       break;
     }
@@ -750,19 +907,21 @@ static void bt_app_av_media_proc(uint16_t event, void *param)
       esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
     } else if (event == ESP_A2D_MEDIA_CTRL_ACK_EVT) {
       a2d = (esp_a2d_cb_param_t *)(param);
-      if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY && a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
-        ESP_LOGI(BT_AV_TAG, "[BT] Media source ready. Starting audio stream...");
+      if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY &&
+          a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+        ESP_LOGI(BT_AV_TAG,
+                 "[BT] Media source ready. Starting audio stream...");
         esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
         s_media_state = APP_AV_MEDIA_STATE_STARTING;
       }
     }
     break;
   }
-  case APP_AV_MEDIA_STATE_STARTING:
-  {
+  case APP_AV_MEDIA_STATE_STARTING: {
     if (event == ESP_A2D_MEDIA_CTRL_ACK_EVT) {
       a2d = (esp_a2d_cb_param_t *)(param);
-      if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START && a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+      if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_START &&
+          a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
         ESP_LOGI(BT_AV_TAG, "[BT] Audio stream started successfully.");
         s_intv_cnt = 0;
         s_media_state = APP_AV_MEDIA_STATE_STARTED;
@@ -783,11 +942,11 @@ static void bt_app_av_media_proc(uint16_t event, void *param)
       s_idle_heartbeat_cnt = 0;
     }
     break;
-  case APP_AV_MEDIA_STATE_STOPPING:
-  {
+  case APP_AV_MEDIA_STATE_STOPPING: {
     if (event == ESP_A2D_MEDIA_CTRL_ACK_EVT) {
       a2d = (esp_a2d_cb_param_t *)(param);
-      if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_SUSPEND && a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
+      if (a2d->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_SUSPEND &&
+          a2d->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
         ESP_LOGI(BT_AV_TAG, "[BT] Audio stream suspended. Disconnecting...");
         s_media_state = APP_AV_MEDIA_STATE_IDLE;
         esp_a2d_source_disconnect(s_peer_bda);
@@ -804,31 +963,28 @@ static void bt_app_av_media_proc(uint16_t event, void *param)
   }
 }
 
-static void bt_app_av_state_connected_hdlr(uint16_t event, void *param)
-{
+static void bt_app_av_state_connected_hdlr(uint16_t event, void *param) {
   esp_a2d_cb_param_t *a2d = NULL;
-  switch (event)
-  {
-  case ESP_A2D_CONNECTION_STATE_EVT:
-  {
+  switch (event) {
+  case ESP_A2D_CONNECTION_STATE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
       bt_on_speaker_lost("A2DP disconnected");
     }
     break;
   }
-  case ESP_A2D_AUDIO_STATE_EVT:
-  {
+  case ESP_A2D_AUDIO_STATE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
-    if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) { s_pkt_cnt = 0; }
+    if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state) {
+      s_pkt_cnt = 0;
+    }
     break;
   }
   case ESP_A2D_AUDIO_CFG_EVT:
     s_audio_cfg_received = true;
     break;
   case ESP_A2D_MEDIA_CTRL_ACK_EVT:
-  case BT_APP_HEART_BEAT_EVT:
-  {
+  case BT_APP_HEART_BEAT_EVT: {
     if (s_audio_cfg_received || user_bluetooth_is_connected()) {
       bt_app_av_media_proc(event, param);
     } else if (s_avrc_connected && s_a2d_state == APP_AV_STATE_CONNECTED) {
@@ -837,10 +993,10 @@ static void bt_app_av_state_connected_hdlr(uint16_t event, void *param)
     }
     break;
   }
-  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT:
-  {
+  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
-    ESP_LOGI(BT_AV_TAG, "%s, delay value: %u * 1/10 ms", __func__, a2d->a2d_report_delay_value_stat.delay_value);
+    ESP_LOGI(BT_AV_TAG, "%s, delay value: %u * 1/10 ms", __func__,
+             a2d->a2d_report_delay_value_stat.delay_value);
     break;
   }
   default:
@@ -849,13 +1005,10 @@ static void bt_app_av_state_connected_hdlr(uint16_t event, void *param)
   }
 }
 
-static void bt_app_av_state_disconnecting_hdlr(uint16_t event, void *param)
-{
+static void bt_app_av_state_disconnecting_hdlr(uint16_t event, void *param) {
   esp_a2d_cb_param_t *a2d = NULL;
-  switch (event)
-  {
-  case ESP_A2D_CONNECTION_STATE_EVT:
-  {
+  switch (event) {
+  case ESP_A2D_CONNECTION_STATE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
     if (a2d->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
       ESP_LOGI(BT_AV_TAG, "[BT] Disconnection complete.");
@@ -868,10 +1021,10 @@ static void bt_app_av_state_disconnecting_hdlr(uint16_t event, void *param)
   case ESP_A2D_MEDIA_CTRL_ACK_EVT:
   case BT_APP_HEART_BEAT_EVT:
     break;
-  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT:
-  {
+  case ESP_A2D_REPORT_SNK_DELAY_VALUE_EVT: {
     a2d = (esp_a2d_cb_param_t *)(param);
-    ESP_LOGI(BT_AV_TAG, "%s, delay value: 0x%u * 1/10 ms", __func__, a2d->a2d_report_delay_value_stat.delay_value);
+    ESP_LOGI(BT_AV_TAG, "%s, delay value: 0x%u * 1/10 ms", __func__,
+             a2d->a2d_report_delay_value_stat.delay_value);
     break;
   }
   default:
@@ -880,19 +1033,18 @@ static void bt_app_av_state_disconnecting_hdlr(uint16_t event, void *param)
   }
 }
 
-static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
-{
-  switch (event)
-  {
+static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event,
+                            esp_avrc_ct_cb_param_t *param) {
+  switch (event) {
   case ESP_AVRC_CT_CONNECTION_STATE_EVT:
   case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
   case ESP_AVRC_CT_METADATA_RSP_EVT:
   case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
   case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
   case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT:
-  case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
-  {
-    bt_app_work_dispatch(bt_av_hdl_avrc_ct_evt, event, param, sizeof(esp_avrc_ct_cb_param_t), NULL);
+  case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT: {
+    bt_app_work_dispatch(bt_av_hdl_avrc_ct_evt, event, param,
+                         sizeof(esp_avrc_ct_cb_param_t), NULL);
     break;
   }
   default:
@@ -901,22 +1053,24 @@ static void bt_app_rc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t
   }
 }
 
-static void bt_av_volume_changed(void)
-{
-  if (esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST, &s_avrc_peer_rn_cap, ESP_AVRC_RN_VOLUME_CHANGE)) {
-    esp_avrc_ct_send_register_notification_cmd(APP_RC_CT_TL_RN_VOLUME_CHANGE, ESP_AVRC_RN_VOLUME_CHANGE, 0);
+static void bt_av_volume_changed(void) {
+  if (esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST,
+                                         &s_avrc_peer_rn_cap,
+                                         ESP_AVRC_RN_VOLUME_CHANGE)) {
+    esp_avrc_ct_send_register_notification_cmd(APP_RC_CT_TL_RN_VOLUME_CHANGE,
+                                               ESP_AVRC_RN_VOLUME_CHANGE, 0);
   }
 }
 
-void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *event_parameter)
-{
-  switch (event_id)
-  {
-  case ESP_AVRC_RN_VOLUME_CHANGE:
-  {
+void bt_av_notify_evt_handler(uint8_t event_id,
+                              esp_avrc_rn_param_t *event_parameter) {
+  switch (event_id) {
+  case ESP_AVRC_RN_VOLUME_CHANGE: {
     ESP_LOGI(BT_RC_CT_TAG, "Volume changed: %d", event_parameter->volume);
-    ESP_LOGI(BT_RC_CT_TAG, "Set absolute volume: volume %d", event_parameter->volume + 5);
-    esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_RN_VOLUME_CHANGE, event_parameter->volume + 5);
+    ESP_LOGI(BT_RC_CT_TAG, "Set absolute volume: volume %d",
+             event_parameter->volume + 5);
+    esp_avrc_ct_send_set_absolute_volume_cmd(APP_RC_CT_TL_RN_VOLUME_CHANGE,
+                                             event_parameter->volume + 5);
     bt_av_volume_changed();
     break;
   }
@@ -925,23 +1079,29 @@ void bt_av_notify_evt_handler(uint8_t event_id, esp_avrc_rn_param_t *event_param
   }
 }
 
-static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
-{
+static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param) {
   if (s_bt_shutting_down) {
     return;
   }
   ESP_LOGD(BT_RC_CT_TAG, "%s evt %d", __func__, event);
   esp_avrc_ct_cb_param_t *rc = (esp_avrc_ct_cb_param_t *)(p_param);
-  switch (event)
-  {
-  case ESP_AVRC_CT_CONNECTION_STATE_EVT:
-  {
+  switch (event) {
+  case ESP_AVRC_CT_CONNECTION_STATE_EVT: {
     uint8_t *bda = rc->conn_stat.remote_bda;
-    ESP_LOGI(BT_RC_CT_TAG, "[AVRC] Remote control %s: [%02x:%02x:%02x:%02x:%02x:%02x]",
-             rc->conn_stat.connected ? "connected" : "disconnected",
-             bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+    ESP_LOGI(BT_RC_CT_TAG,
+             "[AVRC] Remote control %s: [%02x:%02x:%02x:%02x:%02x:%02x]",
+             rc->conn_stat.connected ? "connected" : "disconnected", bda[0],
+             bda[1], bda[2], bda[3], bda[4], bda[5]);
     if (rc->conn_stat.connected) {
       s_avrc_connected = bt_is_peer_addr(rc->conn_stat.remote_bda);
+      /* Reset interval counter so A2DP gets a full fresh timeout from this
+       * point. Without this, the counter keeps running from the start of the
+       * connect attempt and AVRC-only timeout fires too early before A2DP has
+       * time to negotiate. */
+      if (s_avrc_connected && s_a2d_state == APP_AV_STATE_CONNECTING) {
+        s_connecting_intv = 0;
+        ESP_LOGI(BT_AV_TAG, "[BT] AVRC up — reset A2DP wait timer");
+      }
       esp_avrc_ct_send_get_rn_capabilities_cmd(APP_RC_CT_TL_GET_CAPS);
     } else {
       s_avrc_connected = false;
@@ -954,26 +1114,35 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
     break;
   }
   case ESP_AVRC_CT_PASSTHROUGH_RSP_EVT:
-    ESP_LOGI(BT_RC_CT_TAG, "AVRC passthrough response: key_code 0x%x, key_state %d, rsp_code %d", rc->psth_rsp.key_code, rc->psth_rsp.key_state, rc->psth_rsp.rsp_code);
+    ESP_LOGI(
+        BT_RC_CT_TAG,
+        "AVRC passthrough response: key_code 0x%x, key_state %d, rsp_code %d",
+        rc->psth_rsp.key_code, rc->psth_rsp.key_state, rc->psth_rsp.rsp_code);
     break;
   case ESP_AVRC_CT_METADATA_RSP_EVT:
-    ESP_LOGI(BT_RC_CT_TAG, "AVRC metadata response: attribute id 0x%x, %s", rc->meta_rsp.attr_id, rc->meta_rsp.attr_text);
+    ESP_LOGI(BT_RC_CT_TAG, "AVRC metadata response: attribute id 0x%x, %s",
+             rc->meta_rsp.attr_id, rc->meta_rsp.attr_text);
     free(rc->meta_rsp.attr_text);
     break;
   case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
-    ESP_LOGI(BT_RC_CT_TAG, "AVRC event notification: %d", rc->change_ntf.event_id);
-    bt_av_notify_evt_handler(rc->change_ntf.event_id, &rc->change_ntf.event_parameter);
+    ESP_LOGI(BT_RC_CT_TAG, "AVRC event notification: %d",
+             rc->change_ntf.event_id);
+    bt_av_notify_evt_handler(rc->change_ntf.event_id,
+                             &rc->change_ntf.event_parameter);
     break;
   case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
-    ESP_LOGI(BT_RC_CT_TAG, "AVRC remote features %" PRIx32 ", TG features %x", rc->rmt_feats.feat_mask, rc->rmt_feats.tg_feat_flag);
+    ESP_LOGI(BT_RC_CT_TAG, "AVRC remote features %" PRIx32 ", TG features %x",
+             rc->rmt_feats.feat_mask, rc->rmt_feats.tg_feat_flag);
     break;
   case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT:
-    ESP_LOGI(BT_RC_CT_TAG, "remote rn_cap: count %d, bitmask 0x%x", rc->get_rn_caps_rsp.cap_count, rc->get_rn_caps_rsp.evt_set.bits);
+    ESP_LOGI(BT_RC_CT_TAG, "remote rn_cap: count %d, bitmask 0x%x",
+             rc->get_rn_caps_rsp.cap_count, rc->get_rn_caps_rsp.evt_set.bits);
     s_avrc_peer_rn_cap.bits = rc->get_rn_caps_rsp.evt_set.bits;
     bt_av_volume_changed();
     break;
   case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
-    ESP_LOGI(BT_RC_CT_TAG, "Set absolute volume response: volume %d", rc->set_volume_rsp.volume);
+    ESP_LOGI(BT_RC_CT_TAG, "Set absolute volume response: volume %d",
+             rc->set_volume_rsp.volume);
     break;
   default:
     ESP_LOGE(BT_RC_CT_TAG, "%s unhandled event: %d", __func__, event);
@@ -981,11 +1150,11 @@ static void bt_av_hdl_avrc_ct_evt(uint16_t event, void *p_param)
   }
 }
 
-static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len)
-{
-  if (data == NULL || len < 0) { return 0; }
-  if (!is_playing || psram_audio_buffer == NULL)
-  {
+static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len) {
+  if (data == NULL || len < 0) {
+    return 0;
+  }
+  if (!is_playing || psram_audio_buffer == NULL) {
     bt_fill_idle_audio(data, len);
     return len;
   }
@@ -1008,16 +1177,20 @@ static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len)
   return len;
 }
 
-void user_bluetooth_init(void)
-{
+void user_bluetooth_init(void) {
   if (is_bt_initialized) {
-      ESP_LOGI(BT_AV_TAG, "Bluetooth already initialized");
-      return;
+    ESP_LOGI(BT_AV_TAG, "Bluetooth already initialized");
+    return;
   }
+  bt_reset_session_state();
   is_bt_initialized = true;
 
   esp_err_t ret;
-  ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+  /* BLE DRAM release is one-shot for the process lifetime */
+  if (!s_ble_mem_released) {
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_BLE));
+    s_ble_mem_released = true;
+  }
 
   esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
   if (esp_bt_controller_init(&bt_cfg) != ESP_OK) {
@@ -1034,9 +1207,10 @@ void user_bluetooth_init(void)
 
   esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
   bluedroid_cfg.ssp_en = true; /* Force enable SSP for modern headsets */
-  
+
   if ((ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg)) != ESP_OK) {
-    ESP_LOGE(BT_AV_TAG, "%s initialize bluedroid failed: %s", __func__, esp_err_to_name(ret));
+    ESP_LOGE(BT_AV_TAG, "%s initialize bluedroid failed: %s", __func__,
+             esp_err_to_name(ret));
     is_bt_initialized = false;
     return;
   }
@@ -1048,7 +1222,8 @@ void user_bluetooth_init(void)
   }
 
   esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
-  esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE; /* No Input No Output for headless device */
+  esp_bt_io_cap_t iocap =
+      ESP_BT_IO_CAP_NONE; /* No Input No Output for headless device */
   esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
   /*
    * Set default parameters for Legacy Pairing
@@ -1059,29 +1234,42 @@ void user_bluetooth_init(void)
   esp_bt_gap_set_pin(pin_type, 0, pin_code);
 
   char bda_str[18] = {0};
-  ESP_LOGI(BT_AV_TAG, "Own address:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
+  ESP_LOGI(
+      BT_AV_TAG, "Own address:[%s]",
+      bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
 
-  /* Task SAU bluedroid enable — tạo trước sẽ chiếm DRAM làm BTU_StartUp OOM/crash */
+  /* Task SAU bluedroid enable — tạo trước sẽ chiếm DRAM làm BTU_StartUp
+   * OOM/crash */
   bt_app_task_start_up();
   if (!bt_app_task_is_ready()) {
-      ESP_LOGE(BT_AV_TAG, "BtAppTask failed after BT enable — A2DP will not connect");
+    ESP_LOGE(BT_AV_TAG,
+             "BtAppTask failed after BT enable — A2DP will not connect");
   } else {
-      bt_app_work_dispatch(bt_av_hdl_stack_evt, BT_APP_STACK_UP_EVT, NULL, 0, NULL);
+    bt_app_work_dispatch(bt_av_hdl_stack_evt, BT_APP_STACK_UP_EVT, NULL, 0,
+                         NULL);
   }
 }
-void user_bluetooth_deinit(void)
-{
+void user_bluetooth_deinit(void) {
   if (!is_bt_initialized) {
     ESP_LOGW(BT_AV_TAG, "Bluetooth not initialized, skipping deinit.");
     return;
   }
 
   s_bt_shutting_down = true;
+  s_a2dp_profile_ready = false;
 
-  ESP_LOGW(BT_AV_TAG, ">>> STEP 0: Forcing Disconnect from remote speakers...");
-  /* Try to disconnect any active A2DP connection first */
+  const bool was_paging = (s_a2d_state == APP_AV_STATE_CONNECTING ||
+                           s_a2d_state == APP_AV_STATE_CONNECTED);
+  s_a2d_state = APP_AV_STATE_UNCONNECTED;
+  s_media_state = APP_AV_MEDIA_STATE_IDLE;
+
+  ESP_LOGW(BT_AV_TAG,
+           ">>> STEP 0: Cancel connect / disconnect (was_paging=%d)...",
+           (int)was_paging);
   esp_a2d_source_disconnect(s_peer_bda);
-  vTaskDelay(pdMS_TO_TICKS(500));
+  /* Mid-page SW3 OFF leaves speaker half-busy — wait longer before tearing
+   * stack down */
+  vTaskDelay(pdMS_TO_TICKS(was_paging ? 2500 : 1500));
 
   ESP_LOGW(BT_AV_TAG, ">>> STEP 1: Stopping Heartbeat Timer...");
   if (s_tmr != NULL) {
@@ -1099,7 +1287,8 @@ void user_bluetooth_deinit(void)
   /* esp_bluedroid_disable is a heavy blocking call */
   esp_err_t ret = esp_bluedroid_disable();
   if (ret != ESP_OK) {
-    ESP_LOGE(BT_AV_TAG, "esp_bluedroid_disable failed: %s", esp_err_to_name(ret));
+    ESP_LOGE(BT_AV_TAG, "esp_bluedroid_disable failed: %s",
+             esp_err_to_name(ret));
   }
   vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -1121,31 +1310,30 @@ void user_bluetooth_deinit(void)
   ESP_LOGW(BT_AV_TAG, ">>> Bluetooth stack shut down complete. HEAP freed.");
 }
 
-bool user_bluetooth_is_connected(void)
-{
+bool user_bluetooth_is_connected(void) {
   return s_a2d_state == APP_AV_STATE_CONNECTED;
 }
 
-bool user_bluetooth_is_active(void)
-{
+bool user_bluetooth_is_active(void) {
   return is_bt_initialized && !s_bt_shutting_down;
 }
 
-bool user_bluetooth_is_media_ready(void)
-{
+bool user_bluetooth_is_media_ready(void) {
   return s_a2d_state == APP_AV_STATE_CONNECTED &&
          s_media_state == APP_AV_MEDIA_STATE_STARTED;
 }
 
-bool user_bluetooth_wait_for_media(uint32_t timeout_ms)
-{
+bool user_bluetooth_is_recovering(void) { return s_recovering_speaker; }
+
+bool user_bluetooth_wait_for_media(uint32_t timeout_ms) {
   if (!user_bluetooth_is_active()) {
     return false;
   }
   if (user_bluetooth_is_media_ready()) {
     return true;
   }
-  ESP_LOGI(BT_AV_TAG, "Waiting up to %" PRIu32 " ms for A2DP audio stream...", timeout_ms);
+  ESP_LOGI(BT_AV_TAG, "Waiting up to %" PRIu32 " ms for A2DP audio stream...",
+           timeout_ms);
   uint32_t elapsed = 0;
   while (elapsed < timeout_ms) {
     if (user_bluetooth_is_media_ready()) {
@@ -1164,18 +1352,17 @@ bool user_bluetooth_wait_for_media(uint32_t timeout_ms)
   return false;
 }
 
-bool user_bluetooth_is_link_ready(void)
-{
+bool user_bluetooth_is_link_ready(void) {
   return user_bluetooth_is_connected() || s_avrc_connected;
 }
 
-bool user_bluetooth_wait_for_connect(uint32_t timeout_ms)
-{
+bool user_bluetooth_wait_for_connect(uint32_t timeout_ms) {
   if (!is_bt_initialized) {
     return false;
   }
 
-  ESP_LOGI(BT_AV_TAG, "Waiting up to %" PRIu32 " ms for Bluetooth...", timeout_ms);
+  ESP_LOGI(BT_AV_TAG, "Waiting up to %" PRIu32 " ms for Bluetooth...",
+           timeout_ms);
   uint32_t elapsed = 0;
   while (elapsed < timeout_ms) {
     if (user_bluetooth_is_connected()) {
@@ -1187,7 +1374,8 @@ bool user_bluetooth_wait_for_connect(uint32_t timeout_ms)
       return true;
     }
     if (s_bt_retry_count >= BT_CONNECT_RETRY_MAX) {
-      ESP_LOGW(BT_AV_TAG, "Bluetooth exhausted retries. Continuing without audio link.");
+      ESP_LOGW(BT_AV_TAG,
+               "Bluetooth exhausted retries. Continuing without audio link.");
       return false;
     }
     vTaskDelay(pdMS_TO_TICKS(500));

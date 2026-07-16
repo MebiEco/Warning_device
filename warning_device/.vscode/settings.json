@@ -1,0 +1,12 @@
+{
+    "idf.currentSetup": "d:\\tuvo\\esp\\v5.3.4\\esp-idf",
+    "idf.flashType": "UART",
+    "idf.portWin": "COM3",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32"
+    },
+    "idf.openOcdConfigs": [
+        "interface/ftdi/esp_ftdi.cfg",
+        "target/esp32.cfg"
+    ]
+}
