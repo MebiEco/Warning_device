@@ -1,0 +1,25 @@
+# ESP-IDF build
+build/
+sdkconfig.old
+
+# IDE / editor
+.vscode/
+.idea/
+*.code-workspace
+.cache/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets / local overrides (keep templates only)
+*.pem
+*.key
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
